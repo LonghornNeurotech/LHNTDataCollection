@@ -1,0 +1,20 @@
+ID,First,Last,EID,StimulantUse,CaffeineMg,MealSize,MealDesc,Exercised,ExerciseDesc,HairProduct,OtherHair,LastTime,SessionNum
+1.0,Jane,Doe,jdo1234,0.0,> 150 mg,Medium meal,big portion,,walked down speedway,,,2024-10-27 16:31:25.955700,407.0
+2.0,jimmy,neutron,jn1234,0.0,,Heavy meal,big fat meal that made me fat and big,,swam up niagra falls,,,2024-10-26 19:48:04.955545,4.0
+3.0,Samarth,Rao,spr957,0.0,0 mg,Heavy meal,Tacos,,,,,2024-10-27 22:23:40.146592,6.0
+4.0,Maddox,Fletcher,emf2676,0.0,50 - 99 mg,No meal,Have not eaten in the last 12 hours,,Have not exercised in the past 12 hours,,,2024-10-27 17:53:12.182286,1.0
+5.0,Ademola,Adetosoye,asa3834,0.0,1 - 49 mg,Medium meal,Flour tortilla with ground beef and mozzerella cheeze + green salsa- 4 medium sized slices,,,,,2024-11-03 17:52:47.098981,1.0
+6.0,Maddox,,,0.0,0 mg,No meal,lol,,,,,2025-01-19 16:59:46.251181,1.0
+7.0,,,,0.0,,,,,,,,2025-01-19 17:03:00.911234,1.0
+8.0,,,,0.0,,,,,,,,2025-01-19 17:17:06.836111,1.0
+9.0,asdjf,adsfdf,dfg,0.0,,,,,,,,2025-01-19 17:19:36.704324,1.0
+10.0,asdf,asdf,dd,0.0,,,,,,,,2025-01-19 17:21:37.975975,1.0
+11.0,asdfdddfdf,ff,ff,0.0,,,,,,,,2025-01-19 17:39:08.796376,1.0
+12.0,ddfdfdee,ee,ee,0.0,,,,,,,,2025-01-19 17:39:53.297859,1.0
+13.0,gg,gg,gg,0.0,,,,,,,,2025-01-19 17:41:13.227931,1.0
+14.0,asdf,ddfd,dfdfdf,0.0,,,,,,,,2025-01-26 16:51:39.036768,1.0
+15.0,asdfd,dfgb,mhmd,0.0,,,,,,,,2025-01-26 16:57:38.050076,1.0
+16.0,j,j,j,0.0,,,,,,,,2025-01-26 17:01:27.750183,1.0
+17.0,q,q,q,0.0,,,,,,,,2025-01-26 17:05:46.326255,1.0
+18.0,a,a,a,0.0,,,,,,,,2025-01-26 17:10:23.494259,1.0
+19.0,t,t,t,0.0,,,,,,,,2025-01-26 17:42:03.298657,1.0
