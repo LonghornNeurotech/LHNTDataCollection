@@ -17,6 +17,9 @@ from torch.utils.data import TensorDataset as TData
 from model_prep import preprocess, balancing
 from path import Path
 import random
+import zipfile
+import pickle
+import io
 
 def get_box_drive_path():
     base_path = Path.home() / "Box"
@@ -35,6 +38,11 @@ def access_folder(folder_name="LHNT EEG"):
 
 def name_match(n, file_list):
     matched_files = [x for x in file_list if n in x.name.lower()]
+    return matched_files if matched_files else None
+
+def all_sessions_match(file_list):
+    all_files = "session"
+    matched_files = [x for x in file_list if all_files in x.name.lower()]
     return matched_files if matched_files else None
 
 def main():
@@ -186,10 +194,10 @@ def main():
 
                         try:
                             files = access_folder()
-                            matched_files = name_match(name, files)
+                            matched_files = name_match(name, files) #check if name found in offline database
 
-                            if matched_files:
-                                selected_file = random.choice(matched_files)  # Select a random file
+                            if matched_files: #if name found
+                                selected_file = random.choice(matched_files)
 
                                 # Display success message with the selected file
                                 success_text = small_font.render(f"Using {selected_file.name} for testing", True, GREEN)
@@ -199,16 +207,43 @@ def main():
                                 pygame.display.flip()
                                 time.sleep(2)  # Pause for 2 seconds before proceeding
 
-                                in_name_input = False
-                                in_questionaire_subject = True  # Proceed to the next screen
-                            else:
+                            else: #if name not found --> use random session
+                                selected_file = random.choice(all_sessions_match(files))  # Select a random file from any of the sessions
+
                                 # Display error message
-                                error_text = small_font.render("No data found for this user.", True, RED)
+                                error_text = small_font.render(f"No data found for this user, using random session: {selected_file.name}", True, RED)
                                 error_rect = error_text.get_rect(
                                     center=(infoObject.current_w // 2, infoObject.current_h // 1.5))
                                 screen.blit(error_text, error_rect)
                                 pygame.display.flip()
                                 time.sleep(2)  # Pause before retrying
+
+                            in_name_input = False
+                            in_questionaire_subject = True  # Proceed to the next screen
+
+                            #selecting the random pickles to use and filling offline_sigs with the offline data
+                            with zipfile.ZipFile(selected_file, "r") as zip_ref:
+                                #print(zip_ref.namelist())
+                                left_pkl_files = [f for f in zip_ref.namelist() if os.path.basename(f).startswith("left")]
+                                selected_left_pkl = random.choice(left_pkl_files)  # Select a random left pkl
+                                right_pkl_files = [f for f in zip_ref.namelist() if os.path.basename(f).startswith("right")]
+                                selected_right_pkl = random.choice(right_pkl_files)  # Select a random right pkl
+                                #print(selected_left_pkl)
+                                #print(selected_right_pkl)
+
+                                offline_left_sigs = []
+                                offline_right_sigs = []
+
+                                with zip_ref.open(selected_left_pkl) as file:
+                                    left_pkl_data = pickle.load(io.BytesIO(file.read()))
+                                    offline_left_sigs.append(left_pkl_data[0])
+
+                                with zip_ref.open(selected_right_pkl) as file:
+                                    right_pkl_data = pickle.load(io.BytesIO(file.read()))
+                                    offline_right_sigs.append(right_pkl_data[0])
+
+                                #print(offline_left_sigs)
+                                #print(offline_right_sigs)
 
                         except FileNotFoundError as e:
                             error_text = small_font.render(str(e), True, RED)
