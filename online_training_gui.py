@@ -2,7 +2,7 @@ import pygame
 import sys
 import time
 import numpy as np
-from eeg_processor import EEGProcessor
+from eeg_processor import EEGProcessor, partition_trial_data
 from Noise_Model import noise_model
 import display_functions
 import torch
@@ -480,6 +480,13 @@ def main():
 
             trial_length = time.perf_counter() - loading_start_time
             trial_data = eeg_processor.get_recent_data(trial_length)
+            trial_beginning, test_window, trial_end = partition_trial_data(trial_data)
+            # Print shapes
+            print("trial_beginning size =", trial_beginning.shape)
+            print("test_window size =", test_window.shape)
+            print("trial_end size =", trial_end.shape)
+
+
             batch_data.append(trial_data)
 
             if not running:

@@ -29,6 +29,34 @@ def find_serial_port():
     
     return None
 
+def partition_trial_data(trial_data, min_boundary = 125, window_ratio = 0.1):
+            # Get total number of time points
+            total_length = trial_data.shape[2]  # Use dim=2 for time axis (1,16,total_length)
+
+            # Define window size (10% of total time points)
+            window_size = max(int(window_ratio * total_length), 1)
+
+            # Ensure there's enough room for at least 125 points in beginning and end
+            max_start_idx = total_length - window_size - min_boundary
+
+            if max_start_idx <= min_boundary:
+                print("Warning: Not enough data points to ensure a valid partition with 125-point buffers.")
+                # Handle the situation
+                trial_beginning = trial_data[:, :, :min_boundary]  # Use the first 125 points
+                test_window = trial_data[:, :, min_boundary:min_boundary + window_size]  # Just after the boundary
+                trial_end = trial_data[:, :, min_boundary + window_size:]  # The rest
+            else:
+                # Randomly select start index ensuring the window is not too close to the edges
+                window_start = np.random.randint(min_boundary, max_start_idx)
+
+                # Partition along the time axis (dim=2)
+                trial_beginning = trial_data[:, :, :window_start]  # Before the window
+                test_window = trial_data[:, :, window_start:window_start + window_size]  # Random window
+                trial_end = trial_data[:, :, window_start + window_size:]  # After the window
+
+            return trial_beginning, test_window, trial_end
+
+
 class EEGProcessor:
     def __init__(self):
         # Initialize BrainFlow
