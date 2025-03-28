@@ -57,6 +57,12 @@ def partition_trial_data(trial_data, min_boundary = 125, window_ratio = 0.1):
             return trial_beginning, test_window, trial_end
 
 
+def save_data(name, file):
+    # Based on the name, decide what directory to save the file into
+
+    return
+
+
 class EEGProcessor:
     def __init__(self):
         # Initialize BrainFlow

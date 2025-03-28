@@ -86,6 +86,7 @@ def main():
 
     # Batch data buffer
     batch_data = []
+    test_segments = []
 
 
     # Bar Settings
@@ -418,6 +419,7 @@ def main():
             # From center to left green bar
             max_length = center_pos[0] - (left_green_bar_pos[0] + green_bar_width)
 
+            # Individual Trial Loop
             while time.perf_counter() - loading_start_time < loading_duration and current_length < max_length:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
@@ -439,23 +441,25 @@ def main():
                 # Redraw trial info
                 screen.blit(trial_info, trial_info_rect)
 
+                # Get most recent data
                 model_input = eeg_processor.get_recent_data(.5) # Change to 1 with real board
+                # Predict off the data
+                predicted_direction = model(model_input)[0]            
 
-                current_direction = model(model_input)[0]            
-
-                if current_direction[0] > current_direction[1]:
-                    current_direction = "left"
+                # Update based on prediction
+                if predicted_direction[0] > predicted_direction[1]:
+                    predicted_direction = "left"
                 else:
-                    current_direction = "right"
+                    predicted_direction = "right"
 
                 # Calling noise model
-                # current_direction = noise_model(direction, current_direction)
+                # predicted_direction = noise_model(direction, predicted_direction)
 
                 # Redraw Arrow
                 if direction == 'left':
                     
                     # Move bar to reflect input from model
-                    if current_direction == 'left':
+                    if predicted_direction == 'left':
                         current_length += 3
                         
                     else:
@@ -476,23 +480,19 @@ def main():
                         current_length,
                         loading_bar_thickness
                     ))
-                else:
+                else: # Right
 
                     # Move bar to reflect input from model
-                    if current_direction == 'right':
+                    if predicted_direction == 'right':
                         current_length += 3
                         
                     else:
                         current_length -= 3
-                        
-                    model_input = eeg_processor.get_recent_data(.5) # Change to 1 with real board
 
-                    current_direction = model(model_input)[0]
-
-                    if current_direction[0] > current_direction[1]:
-                        current_direction = "left"
+                    if predicted_direction[0] > predicted_direction[1]:
+                        predicted_direction = "left"
                     else:
-                        current_direction = "right"
+                        predicted_direction = "right"
 
                     pygame.draw.polygon(screen, arrow_color, [
                         (center_pos[0] + arrow_length, center_pos[1] - arrow_y_offset),
@@ -515,14 +515,21 @@ def main():
 
             trial_length = time.perf_counter() - loading_start_time
             trial_data = eeg_processor.get_recent_data(trial_length)
+        
             trial_beginning, test_window, trial_end = partition_trial_data(trial_data)
-            # Print shapes
-            print("trial_beginning size =", trial_beginning.shape)
-            print("test_window size =", test_window.shape)
-            print("trial_end size =", trial_end.shape)
+            
+        
+            #print("trial_beginning size =", trial_beginning.shape)
+            #print("test_window size =", test_window.shape)
+            #print("trial_end size =", trial_end.shape)
 
-
+            # Save each test window and trial data
+            test_segments.append(test_window)
+            # Old version of batch data
             batch_data.append(trial_data)
+            # New version of batch data
+            #batch_data_new.append({trial_beginning, trial_end})
+
 
             if not running:
                 break
@@ -561,6 +568,20 @@ def main():
             # also activates after final trial is completed (when batch size =/= 2)
             if direction == 'right' and ((trial_number % batch_size == 0) or trial_number == total_trials):
                 # TODO: Call function to train model (full batches) input parameter is np array training_data
+                
+                # TODO: Implement batch saving / test segment saving
+                # Always save the previous test segments
+                # save_data(name, test_segments)
+
+                # Only save a batch if it's old enough
+                # batch_queue.add(batch_data)
+                # if batch_queue.length() == 5:
+                    # save_data(name, batch_queue.get())
+
+
+
+                
+                
                 # train model with batch_data list
                 epochs = 10
                 trials = 6
@@ -643,7 +664,11 @@ def main():
 
                     torch.save(model.state_dict(), f"saved_models/{person}_model{i}.pt")
                 print(batch_data)
+                
+                # Clear batch data lists
                 batch_data = []
+                test_segments = []
+
                 clock.tick(60)
                 batch_load_example_time = 3 #seconds
                 batch_load_start_time = time.time()
