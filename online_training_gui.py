@@ -2,9 +2,8 @@ import pygame
 import sys
 import time
 import numpy as np
-from eeg_processor import EEGProcessor
+from eeg_processor import EEGProcessor, partition_trial_data
 from batch_queue import BatchQueue
-from Noise_Model import noise_model
 import display_functions
 import torch
 from Model import PCNN_3Branch
@@ -16,8 +15,11 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader as DL
 from torch.utils.data import TensorDataset as TData
 from model_prep import preprocess, balancing
-from path import Path
+from pathlib import Path
 import random
+import zipfile
+import pickle
+import io
 
 def get_box_drive_path():
     base_path = Path.home() / "Box"
@@ -38,6 +40,11 @@ def name_match(n, file_list):
     matched_files = [x for x in file_list if n in x.name.lower()]
     return matched_files if matched_files else None
 
+def all_sessions_match(file_list):
+    all_files = "session"
+    matched_files = [x for x in file_list if all_files in x.name.lower()]
+    return matched_files if matched_files else None
+
 def main():
     eeg_processor = EEGProcessor()
     batch_queue = BatchQueue()
@@ -47,6 +54,7 @@ def main():
     model.load_state_dict(checkpoint.state_dict())
     model = model.float()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    person = ""
 
     # Initialize Pygame
     pygame.init()
@@ -80,6 +88,7 @@ def main():
 
     # Batch data buffer
     batch_data = []
+    test_segments = []
 
 
     # Bar Settings
@@ -188,10 +197,10 @@ def main():
 
                         try:
                             files = access_folder()
-                            matched_files = name_match(name, files)
+                            matched_files = name_match(name, files) #check if name found in offline database
 
-                            if matched_files:
-                                selected_file = random.choice(matched_files)  # Select a random file
+                            if matched_files: #if name found
+                                selected_file = random.choice(matched_files)
 
                                 # Display success message with the selected file
                                 success_text = small_font.render(f"Using {selected_file.name} for testing", True, GREEN)
@@ -201,16 +210,43 @@ def main():
                                 pygame.display.flip()
                                 time.sleep(2)  # Pause for 2 seconds before proceeding
 
-                                in_name_input = False
-                                in_questionaire_subject = True  # Proceed to the next screen
-                            else:
+                            else: #if name not found --> use random session
+                                selected_file = random.choice(all_sessions_match(files))  # Select a random file from any of the sessions
+
                                 # Display error message
-                                error_text = small_font.render("No data found for this user.", True, RED)
+                                error_text = small_font.render(f"No data found for this user, using random session: {selected_file.name}", True, RED)
                                 error_rect = error_text.get_rect(
                                     center=(infoObject.current_w // 2, infoObject.current_h // 1.5))
                                 screen.blit(error_text, error_rect)
                                 pygame.display.flip()
                                 time.sleep(2)  # Pause before retrying
+
+                            in_name_input = False
+                            person = name
+
+                            #selecting the random pickles to use and filling offline_sigs with the offline data
+                            with zipfile.ZipFile(selected_file, "r") as zip_ref:
+                                #print(zip_ref.namelist())
+                                left_pkl_files = [f for f in zip_ref.namelist() if os.path.basename(f).startswith("left")]
+                                selected_left_pkl = random.choice(left_pkl_files)  # Select a random left pkl
+                                right_pkl_files = [f for f in zip_ref.namelist() if os.path.basename(f).startswith("right")]
+                                selected_right_pkl = random.choice(right_pkl_files)  # Select a random right pkl
+                                #print(selected_left_pkl)
+                                #print(selected_right_pkl)
+
+                                offline_left_sigs = []
+                                offline_right_sigs = []
+
+                                with zip_ref.open(selected_left_pkl) as file:
+                                    left_pkl_data = pickle.load(io.BytesIO(file.read()))
+                                    offline_left_sigs.append(left_pkl_data[0])
+
+                                with zip_ref.open(selected_right_pkl) as file:
+                                    right_pkl_data = pickle.load(io.BytesIO(file.read()))
+                                    offline_right_sigs.append(right_pkl_data[0])
+
+                                #print(offline_left_sigs)
+                                #print(offline_right_sigs)
 
                         except FileNotFoundError as e:
                             error_text = small_font.render(str(e), True, RED)
@@ -385,6 +421,7 @@ def main():
             # From center to left green bar
             max_length = center_pos[0] - (left_green_bar_pos[0] + green_bar_width)
 
+            # Individual Trial Loop
             while time.perf_counter() - loading_start_time < loading_duration and current_length < max_length:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
@@ -406,23 +443,25 @@ def main():
                 # Redraw trial info
                 screen.blit(trial_info, trial_info_rect)
 
+                # Get most recent data
                 model_input = eeg_processor.get_recent_data(.5) # Change to 1 with real board
+                # Predict off the data
+                predicted_direction = model(model_input)[0]            
 
-                current_direction = model(model_input)[0]            
-
-                if current_direction[0] > current_direction[1]:
-                    current_direction = "left"
+                # Update based on prediction
+                if predicted_direction[0] > predicted_direction[1]:
+                    predicted_direction = "left"
                 else:
-                    current_direction = "right"
+                    predicted_direction = "right"
 
                 # Calling noise model
-                # current_direction = noise_model(direction, current_direction)
+                # predicted_direction = noise_model(direction, predicted_direction)
 
                 # Redraw Arrow
                 if direction == 'left':
                     
                     # Move bar to reflect input from model
-                    if current_direction == 'left':
+                    if predicted_direction == 'left':
                         current_length += 3
                         
                     else:
@@ -443,23 +482,19 @@ def main():
                         current_length,
                         loading_bar_thickness
                     ))
-                else:
+                else: # Right
 
                     # Move bar to reflect input from model
-                    if current_direction == 'right':
+                    if predicted_direction == 'right':
                         current_length += 3
                         
                     else:
                         current_length -= 3
-                        
-                    model_input = eeg_processor.get_recent_data(.5) # Change to 1 with real board
 
-                    current_direction = model(model_input)[0]
-
-                    if current_direction[0] > current_direction[1]:
-                        current_direction = "left"
+                    if predicted_direction[0] > predicted_direction[1]:
+                        predicted_direction = "left"
                     else:
-                        current_direction = "right"
+                        predicted_direction = "right"
 
                     pygame.draw.polygon(screen, arrow_color, [
                         (center_pos[0] + arrow_length, center_pos[1] - arrow_y_offset),
@@ -482,7 +517,21 @@ def main():
 
             trial_length = time.perf_counter() - loading_start_time
             trial_data = eeg_processor.get_recent_data(trial_length)
+        
+            trial_beginning, test_window, trial_end = partition_trial_data(trial_data)
+            
+        
+            #print("trial_beginning size =", trial_beginning.shape)
+            #print("test_window size =", test_window.shape)
+            #print("trial_end size =", trial_end.shape)
+
+            # Save each test window and trial data
+            test_segments.append(test_window)
+            # Old version of batch data
             batch_data.append(trial_data)
+            # New version of batch data
+            #batch_data_new.append({trial_beginning, trial_end})
+
 
             if not running:
                 break
@@ -521,6 +570,20 @@ def main():
             # also activates after final trial is completed (when batch size =/= 2)
             if direction == 'right' and ((trial_number % batch_size == 0) or trial_number == total_trials):
                 # TODO: Call function to train model (full batches) input parameter is np array training_data
+                
+                # TODO: Implement batch saving / test segment saving
+                # Always save the previous test segments
+                # save_data(name, test_segments)
+
+                # Only save a batch if it's old enough
+                # batch_queue.add(batch_data)
+                # if batch_queue.length() == 5:
+                    # save_data(name, batch_queue.get())
+
+
+
+                
+                
                 # train model with batch_data list
                 epochs = 10
                 trials = 6
@@ -603,8 +666,9 @@ def main():
 
                     torch.save(model.state_dict(), f"saved_models/{person}_model{i}.pt")
                 print(batch_data)
-                batch_queue.addToQueue(batch_data)
                 batch_data = []
+                test_segments = []
+
                 clock.tick(60)
                 batch_load_example_time = 3 #seconds
                 batch_load_start_time = time.time()
