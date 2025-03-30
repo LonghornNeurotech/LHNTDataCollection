@@ -3,6 +3,7 @@ import sys
 import time
 import numpy as np
 from eeg_processor import EEGProcessor
+from batch_queue import BatchQueue
 from Noise_Model import noise_model
 import display_functions
 import torch
@@ -39,6 +40,7 @@ def name_match(n, file_list):
 
 def main():
     eeg_processor = EEGProcessor()
+    batch_queue = BatchQueue()
     # load model being used
     model = PCNN_3Branch()
     checkpoint = torch.load("matt_pcnn.pth", map_location=torch.device('cpu'), weights_only=False)
@@ -601,6 +603,7 @@ def main():
 
                     torch.save(model.state_dict(), f"saved_models/{person}_model{i}.pt")
                 print(batch_data)
+                batch_queue.addToQueue(batch_data)
                 batch_data = []
                 clock.tick(60)
                 batch_load_example_time = 3 #seconds
