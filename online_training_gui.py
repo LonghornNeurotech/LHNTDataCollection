@@ -666,6 +666,9 @@ def main():
 
                     torch.save(model.state_dict(), f"saved_models/{person}_model{i}.pt")
                 print(batch_data)
+                batch_queue.addToQueue(batch_data)
+                
+                # Clear batch data lists
                 batch_data = []
                 test_segments = []
 
