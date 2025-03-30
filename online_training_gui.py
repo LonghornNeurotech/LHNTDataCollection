@@ -3,7 +3,6 @@ import sys
 import time
 import numpy as np
 from eeg_processor import EEGProcessor, partition_trial_data
-from Noise_Model import noise_model
 import display_functions
 import torch
 from Model import PCNN_3Branch
@@ -15,7 +14,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader as DL
 from torch.utils.data import TensorDataset as TData
 from model_prep import preprocess, balancing
-from path import Path
+from pathlib import Path
 import random
 import zipfile
 import pickle
@@ -53,6 +52,7 @@ def main():
     model.load_state_dict(checkpoint.state_dict())
     model = model.float()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    person = ""
 
     # Initialize Pygame
     pygame.init()
@@ -220,7 +220,7 @@ def main():
                                 time.sleep(2)  # Pause before retrying
 
                             in_name_input = False
-                            in_questionaire_subject = True  # Proceed to the next screen
+                            person = name
 
                             #selecting the random pickles to use and filling offline_sigs with the offline data
                             with zipfile.ZipFile(selected_file, "r") as zip_ref:
