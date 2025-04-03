@@ -29,6 +29,36 @@ def find_serial_port():
     
     return None
 
+
+def sliding_window_segmentation(segment, window_size=125, stride=100):
+    """
+    Segment a time-series data array using a sliding window.
+    Default Parameters: Window Size of 1 second with 20% overlap
+    
+    Parameters:
+        segment (np.ndarray): Input data with shape (channels, time_points).
+        window_size (int): The fixed window length (default 125).
+        stride (int): The step size between windows (default 125 for non-overlapping).
+        
+    Returns:
+        np.ndarray: Segmented windows with shape (num_windows, channels, window_size).
+    """
+    if segment.shape[0] == 1:
+        segment = segment.squeeze(0)  # Now shape becomes (channels, time_points)
+
+    windows = []
+    num_points = segment.shape[-1]
+    # Slide over the time axis
+    for start in range(0, num_points - window_size + 1, stride):
+        window = segment[:, start:start + window_size]
+        windows.append(window)
+    
+    # Convert to numpy array; shape becomes (num_windows, channels, window_size)
+    return np.stack(windows) if windows else np.array([])
+
+
+
+
 def partition_trial_data(trial_data, min_boundary = 125, window_ratio = 0.1):
             # Get total number of time points
             total_length = trial_data.shape[2]  # Use dim=2 for time axis (1,16,total_length)
@@ -55,12 +85,6 @@ def partition_trial_data(trial_data, min_boundary = 125, window_ratio = 0.1):
                 trial_end = trial_data[:, :, window_start + window_size:]  # After the window
 
             return trial_beginning, test_window, trial_end
-
-
-def save_data(name, file):
-    # Based on the name, decide what directory to save the file into
-
-    return
 
 
 class EEGProcessor:

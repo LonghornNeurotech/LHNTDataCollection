@@ -2,8 +2,9 @@ import pygame
 import sys
 import time
 import numpy as np
-from eeg_processor import EEGProcessor, partition_trial_data
+from eeg_processor import EEGProcessor, partition_trial_data, sliding_window_segmentation
 from batch_queue import BatchQueue
+import queue
 import display_functions
 import torch
 from Model import PCNN_3Branch
@@ -11,6 +12,7 @@ import os
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split as tts
+from box import access_folder, name_match, all_sessions_match, save_batch_data, save_test_data, get_box_drive_path
 from tqdm import tqdm
 from torch.utils.data import DataLoader as DL
 from torch.utils.data import TensorDataset as TData
@@ -20,40 +22,20 @@ import random
 import zipfile
 import pickle
 import io
-
-def get_box_drive_path():
-    base_path = Path.home() / "Box"
-    if base_path.exists():
-        return base_path
-    else:
-        raise FileNotFoundError("Box Drive folder not found.")
-
-def access_folder(folder_name="LHNT EEG"):
-    box_drive_path = get_box_drive_path()
-    folder_path = box_drive_path / folder_name
-    if folder_path.exists():
-        return list(folder_path.iterdir())  # Returns a list of files and folders
-    else:
-        raise FileNotFoundError(f"Folder '{folder_name}' not found in Box Drive.")
-
-def name_match(n, file_list):
-    matched_files = [x for x in file_list if n in x.name.lower()]
-    return matched_files if matched_files else None
-
-def all_sessions_match(file_list):
-    all_files = "session"
-    matched_files = [x for x in file_list if all_files in x.name.lower()]
-    return matched_files if matched_files else None
+from datetime import datetime
 
 def main():
     eeg_processor = EEGProcessor()
-    batch_queue = BatchQueue()
+    #batch_queue = BatchQueue()
+    batch_queue = queue.Queue(maxsize=4)
+    batch_queue_new = queue.Queue(maxsize=4)
     # load model being used
     model = PCNN_3Branch()
     checkpoint = torch.load("matt_pcnn.pth", map_location=torch.device('cpu'), weights_only=False)
     model.load_state_dict(checkpoint.state_dict())
     model = model.float()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model.to(device)  # Move the model to the selected device
     person = ""
 
     # Initialize Pygame
@@ -82,12 +64,13 @@ def main():
     in_after_session_menu = False
     trial_number = 1
     total_trials = 3 # Default number of trials - changed to 2 on 1/25/2025
-    batch_size = 3 #default number of trails in a single batch - added 1/25/2025
+    batch_size = 1 #default number of trails in a single batch - added 1/25/2025
     time_between_sessions = 180 # number of seconds to wait between sessions of data collection
     start_enable_time = time.time() # the time at/after which the start button is enabled
 
     # Batch data buffer
     batch_data = []
+    batch_data_new = []
     test_segments = []
 
 
@@ -239,14 +222,18 @@ def main():
 
                                 with zip_ref.open(selected_left_pkl) as file:
                                     left_pkl_data = pickle.load(io.BytesIO(file.read()))
-                                    offline_left_sigs.append(left_pkl_data[0])
+                                    #offline_left_sigs.append(left_pkl_data[0])
+                                    offline_left_sigs = np.array(left_pkl_data[0])
+
 
                                 with zip_ref.open(selected_right_pkl) as file:
                                     right_pkl_data = pickle.load(io.BytesIO(file.read()))
-                                    offline_right_sigs.append(right_pkl_data[0])
+                                    # offline_right_sigs.append(right_pkl_data[0])
+                                    offline_right_sigs = np.array(right_pkl_data[0])
 
-                                #print(offline_left_sigs)
-                                #print(offline_right_sigs)
+
+                                print(offline_left_sigs.shape)
+                                print(offline_right_sigs.shape)
 
                         except FileNotFoundError as e:
                             error_text = small_font.render(str(e), True, RED)
@@ -520,6 +507,9 @@ def main():
         
             trial_beginning, test_window, trial_end = partition_trial_data(trial_data)
             
+            print("Trial beginning shape: " + str(trial_beginning.shape))
+            print("Trial test shape: " + str(test_window.shape))
+            print("Trial end shape: " + str(trial_end.shape))
         
             #print("trial_beginning size =", trial_beginning.shape)
             #print("test_window size =", test_window.shape)
@@ -530,7 +520,7 @@ def main():
             # Old version of batch data
             batch_data.append(trial_data)
             # New version of batch data
-            #batch_data_new.append({trial_beginning, trial_end})
+            batch_data_new.append((trial_beginning, trial_end))
 
 
             if not running:
@@ -572,61 +562,96 @@ def main():
                 # TODO: Call function to train model (full batches) input parameter is np array training_data
                 
                 # TODO: Implement batch saving / test segment saving
+
                 # Always save the previous test segments
-                # save_data(name, test_segments)
-
-                # Only save a batch if it's old enough
-                # batch_queue.add(batch_data)
-                # if batch_queue.length() == 5:
-                    # save_data(name, batch_queue.get())
-
-
-
+                save_test_data(name, "test_block",test_segments)
+                # Always save a raw copy of the data
+                save_batch_data(name, "raw_batch", batch_data, "raw")
                 
+                # Manage the batch queue
+                batch_queue.put(batch_data)
+                batch_queue_new.put(batch_data_new)
+                if(batch_queue_new.qsize() >= 4):
+                    # When the data has aged, commit it to the training folder.
+                    # Each trial in this batch is split into beginning and end.
+                    # A random test window was removed between these segments.
+                    aged_batch = batch_queue_new.get()
+                    save_batch_data(name, "split_batch", aged_batch, "training")
+                    
+
+                # Prepare online windows and labels for training run
+                all_windows = []
+                all_labels = []
+                offline_left_windows = []
+                offline_right_windows = []
+                for idx, (beginning, end) in enumerate(batch_data_new):
+                    # Remove any extra dimensions if needed
+                    beginning_segment = beginning.squeeze(0)  # shape: (channels, time_points)
+                    end_segment = end.squeeze(0)
+                    
+                    # Apply sliding window segmentation
+                    beginning_windows = sliding_window_segmentation(beginning_segment, window_size=125, stride=100)
+                    end_windows = sliding_window_segmentation(end_segment, window_size=125, stride=100)
+                    
+                    # Determine label based on trial index
+                    label = 0 if idx % 2 == 0 else 1
+                    
+                    # Append windows and corresponding labels
+                    for window in beginning_windows:
+                        all_windows.append(window)
+                        all_labels.append(label)
+                    for window in end_windows:
+                        all_windows.append(window)
+                        all_labels.append(label)
+
+                # All online windows have been segmented and labeled
+                print("Window shape:" + str(len(all_windows)))
+                print("Labels shape:" + str(len(all_labels)))
+                for i in range(len(all_labels)):
+                    print(str(all_labels[i]) + " " +  str(i))
+                    print("Trial length " + str(i) + ": " + str(all_windows[i].shape))
+
+                # Prepare offline windows and labels
+                print("Offline left sigs shape: " + str(offline_left_sigs.shape))
+                print("Offline left sigs shape: " + str(offline_right_sigs.shape))
+                offline_left_windows = sliding_window_segmentation(offline_left_sigs, window_size=125, stride = 100)
+                offline_right_windows = sliding_window_segmentation(offline_left_sigs, window_size=125, stride = 100)
+                print("Offline left windows shape: " + str(len(offline_left_windows)))
+                print("Offline right windows shape: " + str(len(offline_right_windows)))
+                for window in offline_left_windows:
+                        all_windows.append(window)
+                        all_labels.append(0)
+                for window in offline_right_windows:
+                        all_windows.append(window)
+                        all_labels.append(1)
+
+                all_windows_np = np.stack(all_windows)  # shape: (num_windows, channels, 125)
+                all_labels_np = np.array(all_labels)      # shape: (num_windows,)
+    
+                print("All windows, on and off line: " + str(len(all_windows)))
+                print("All windows shape:", all_windows_np.shape)
+                print("All labels shape:", all_labels_np.shape)
                 
-                # train model with batch_data list
+                train_sigs, val_sigs, train_labs, val_labs = tts(all_windows_np, all_labels_np, test_size=0.25)
+
+                # Create PyTorch datasets
+                train_ds = TData(torch.from_numpy(train_sigs).float(), torch.from_numpy(train_labs).long())
+                val_ds = TData(torch.from_numpy(val_sigs).float(), torch.from_numpy(val_labs).long())
+
+                # Create DataLoaders
+                train_dl = DL(train_ds, batch_size=64, shuffle=True)
+                valid_dl = DL(val_ds, batch_size=64, shuffle=True)
+
+                # --- Training loop using all_windows/all_labels ---
                 epochs = 10
-                trials = 6
                 criterion = torch.nn.CrossEntropyLoss()
                 optim = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
                 train_losses = []
                 val_losses = []
                 accs = []
 
-                # preprocess left hand and right hand signals
-                segments_left = preprocess(offline_left_sigs)
-                segments_right = preprocess(offline_right_sigs)
-                for i in range(epochs):
-                    # randomly sample p fraction of dataset, ensuring balanced left and right classes
-                    offline_left, offline_right = balancing(segments_left, segments_right, p=0.25)
-                    labels_left = [0] * len(online_left)
-                    labels_right = [1] * len(online_right)
-
-                    ## collect real time signals
-                    left_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 0]
-                    right_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 1]
-
-                    # preprocess left and right hand signals
-                    left_segments = preprocess(left_signals)
-                    right_segments = preprocess(right_signals)
-
-                    # balance classes for online data
-                    online_left, online_right = balancing(left_segments, right_segments)
-                    left_labels = [0] * len(online_left)
-                    right_labels = [1] * len(online_right)
-
-                    # combine data and create data loaders
-                    all_sigs = offline_left + offline_right + online_left + online_right
-                    all_labels = labels_left + labels_right + left_labels + right_labels
-
-                    train_sigs, val_sigs, train_labs, val_labs = tts(all_sigs, all_labels, test_size = 0.25)
-                    train_ds = TData(torch.from_numpy(np.stack(train_sigs)), torch.tensor(train_labs))
-                    val_ds = TData(torch.from_numpy(np.stack(val_sigs)), torch.tensor(val_labs))
-
-                    train_dl = DL(train_ds, batch_size = 64, shuffle = True)
-                    valid_dl = DL(val_ds, batch_size = 64, shuffle = True)
-
-                    ## train and evaluate the model on the new data
+                for epoch in range(epochs):
+                    # Training phase
                     model.train()
                     total_train_loss = 0.0
                     pbar = tqdm(total=len(train_dl))
@@ -639,16 +664,17 @@ def main():
                         loss.backward()
                         optim.step()
                         total_train_loss += loss.item()
-                        pbar.set_description(f"Epoch {i + 1}    loss={total_train_loss / (j + 1):0.4f}")
+                        pbar.set_description(f"Epoch {epoch + 1} loss={total_train_loss / (j + 1):0.4f}")
                         pbar.update(1)
                     pbar.close()
-                    train_losses.append(total_train_loss/len(train_dl))
-
+                    train_losses.append(total_train_loss / len(train_dl))
+                    
+                    # Validation phase
                     model.eval()
                     total_val_loss = 0.0
                     total_accuracy = 0.0
                     with torch.no_grad():
-                        p_bar = tqdm(total=len(valid_dl))
+                        pbar = tqdm(total=len(valid_dl))
                         for j, (batch, label) in enumerate(valid_dl):
                             batch = batch.to(device).to(torch.float32)
                             label = label.to(device)
@@ -658,19 +684,269 @@ def main():
                             acc = (prob_pred.argmax(-1) == label).float().mean()
                             total_val_loss += loss.item()
                             total_accuracy += acc.item()
-                            p_bar.set_description(f"val_loss={total_val_loss / (j + 1):.4f}  val_acc={total_accuracy / (j + 1):.4f}")
-                            p_bar.update(1)
-                        p_bar.close()
-                    val_losses.append(total_val_loss/len(valid_dl))
-                    accs.append(total_accuracy/len(valid_dl))
+                            pbar.set_description(f"Val loss={total_val_loss / (j + 1):.4f}  Val acc={total_accuracy / (j + 1):.4f}")
+                            pbar.update(1)
+                        pbar.close()
+                    val_losses.append(total_val_loss / len(valid_dl))
+                    accs.append(total_accuracy / len(valid_dl))
+                    box_drive_path = get_box_drive_path()
+                    base_folder = os.path.join(box_drive_path, "LHNT EEG", "GUI Test Uploads")
+                    user_folder = os.path.join(base_folder, name)
+                    models_folder = os.path.join(user_folder, "models")
+                    os.makedirs(models_folder, exist_ok=True)  # Create the folder if it doesn't exist
 
-                    torch.save(model.state_dict(), f"saved_models/{person}_model{i}.pt")
-                print(batch_data)
-                batch_queue.addToQueue(batch_data)
-                
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                    # Assume val_accuracy is computed during validation
+                    model_filename = f"valacc{total_accuracy:.2f}_{name}_model_{timestamp}_epoch{epoch:02d}.pt"
+                    model_path = os.path.join(models_folder, model_filename)
+                    torch.save(model.state_dict(), model_path)
+
+                # train model with batch_data list
+                # epochs = 10
+                # criterion = torch.nn.CrossEntropyLoss()
+                # optim = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+                # train_losses = []
+                # val_losses = []
+                # accs = []
+
+                # preprocess left hand and right hand signals
+                # segments_left = preprocess(offline_left_sigs)
+                # segments_right = preprocess(offline_right_sigs)
+                # #online_left = batch_data[:, ]
+
+                # for i, trial_tuple in enumerate(batch_data):
+                #     beginning, end = trial_tuple
+                #     if i%2 == 0: # Even Index = Left
+                #         left_signals.
+
+                # for i in range(epochs):
+                #     # Randomly sample p fraction of dataset, ensuring balanced left and right classes
+                #     offline_left, offline_right = balancing(segments_left, segments_right, p=0.25)
+                    
+                #     # Extract left and right segments from batch_data_new 
+                #     # This handles the split segments structure (trial_beginning, trial_end)
+                #     left_signals = []
+                #     right_signals = []
+                    
+                #     # Process each tuple of (beginning, end) segments
+                #     for idx, (beginning, end) in enumerate(batch_data_new):
+                #         if idx % 2 == 0:  # Even indices are left hand trials
+                #             # Add both parts separately to maintain their individual characteristics
+                #             left_signals.append(beginning)
+                #             left_signals.append(end)
+                #         else:  # Odd indices are right hand trials
+                #             right_signals.append(beginning)
+                #             right_signals.append(end)
+                    
+                #     # Preprocess left and right hand signals
+                #     left_segments = preprocess(left_signals)
+                #     right_segments = preprocess(right_signals)
+                    
+                #     # Balance classes for online data
+                #     online_left, online_right = balancing(left_segments, right_segments)
+                    
+                #     # Create labels for all segments
+                #     offline_left_labels = [0] * len(offline_left)
+                #     offline_right_labels = [1] * len(offline_right)
+                #     online_left_labels = [0] * len(online_left)
+                #     online_right_labels = [1] * len(online_right)
+                    
+                #     # Combine all data and create data loaders
+                #     all_sigs = offline_left + offline_right + online_left + online_right
+                #     all_labels = offline_left_labels + offline_right_labels + online_left_labels + online_right_labels
+                    
+                #     # Split into training and validation sets
+                #     train_sigs, val_sigs, train_labs, val_labs = tts(all_sigs, all_labels, test_size=0.25)
+                #     # Check shapes before stacking
+                #     for sig in train_sigs:
+                #         print("Train signal shape:", sig.shape)
+                #     assert len(train_sigs) > 0, "No training signals found!"
+
+                #     train_ds = TData(torch.from_numpy(np.stack(train_sigs)), torch.tensor(train_labs))
+                #     val_ds = TData(torch.from_numpy(np.stack(val_sigs)), torch.tensor(val_labs))
+                    
+                #     train_dl = DL(train_ds, batch_size=64, shuffle=True)
+                #     valid_dl = DL(val_ds, batch_size=64, shuffle=True)
+                    
+                #     # Train and evaluate the model on the new data
+                #     model.train()
+                #     total_train_loss = 0.0
+                #     pbar = tqdm(total=len(train_dl))
+                #     for j, (batch, label) in enumerate(train_dl):
+                #         batch = batch.to(device).to(torch.float32)
+                #         label = label.to(device)
+                #         optim.zero_grad()
+                #         y_pred = model(batch)
+                #         loss = criterion(y_pred, label)
+                #         loss.backward()
+                #         optim.step()
+                #         total_train_loss += loss.item()
+                #         pbar.set_description(f"Epoch {i + 1}    loss={total_train_loss / (j + 1):0.4f}")
+                #         pbar.update(1)
+                #     pbar.close()
+                #     train_losses.append(total_train_loss/len(train_dl))
+                    
+                #     model.eval()
+                #     total_val_loss = 0.0
+                #     total_accuracy = 0.0
+                #     with torch.no_grad():
+                #         p_bar = tqdm(total=len(valid_dl))
+                #         for j, (batch, label) in enumerate(valid_dl):
+                #             batch = batch.to(device).to(torch.float32)
+                #             label = label.to(device)
+                #             y_pred = model(batch)
+                #             loss = criterion(y_pred, label)
+                #             prob_pred = torch.nn.functional.softmax(y_pred, -1)
+                #             acc = (prob_pred.argmax(-1) == label).float().mean()
+                #             total_val_loss += loss.item()
+                #             total_accuracy += acc.item()
+                #             p_bar.set_description(f"val_loss={total_val_loss / (j + 1):.4f}  val_acc={total_accuracy / (j + 1):.4f}")
+                #             p_bar.update(1)
+                #         p_bar.close()
+                #     val_losses.append(total_val_loss/len(valid_dl))
+                #     accs.append(total_accuracy/len(valid_dl))
+                    
+                #     torch.save(model.state_dict(), f"saved_models/{person}_model{i}.pt")
+
+                print(batch_data_new)  # Print the batch_data_new instead of batch_data
+
                 # Clear batch data lists
                 batch_data = []
                 test_segments = []
+                batch_data_new = []
+
+                # Get a new set of offline data for the next round
+                try:
+                            files = access_folder()
+                            matched_files = name_match(name, files) #check if name found in offline database
+
+                            if matched_files: #if name found
+                                selected_file = random.choice(matched_files)
+
+                            else: #if name not found --> use random session
+                                selected_file = random.choice(all_sessions_match(files))  # Select a random file from any of the sessions
+
+                            person = name
+
+                            #selecting the random pickles to use and filling offline_sigs with the offline data
+                            with zipfile.ZipFile(selected_file, "r") as zip_ref:
+                                #print(zip_ref.namelist())
+                                left_pkl_files = [f for f in zip_ref.namelist() if os.path.basename(f).startswith("left")]
+                                selected_left_pkl = random.choice(left_pkl_files)  # Select a random left pkl
+                                right_pkl_files = [f for f in zip_ref.namelist() if os.path.basename(f).startswith("right")]
+                                selected_right_pkl = random.choice(right_pkl_files)  # Select a random right pkl
+                                #print(selected_left_pkl)
+                                #print(selected_right_pkl)
+
+                                # offline_left_sigs = []
+                                # offline_right_sigs = []
+
+                                with zip_ref.open(selected_left_pkl) as file:
+                                    left_pkl_data = pickle.load(io.BytesIO(file.read()))
+                                    #offline_left_sigs.append(left_pkl_data[0])
+                                    offline_left_sigs = np.array(left_pkl_data[0])
+
+
+                                with zip_ref.open(selected_right_pkl) as file:
+                                    right_pkl_data = pickle.load(io.BytesIO(file.read()))
+                                    # offline_right_sigs.append(right_pkl_data[0])
+                                    offline_right_sigs = np.array(right_pkl_data[0])
+
+
+                                print(offline_left_sigs.shape)
+                                print(offline_right_sigs.shape)
+
+                except FileNotFoundError as e:
+                    error_text = small_font.render(str(e), True, RED)
+                    error_rect = error_text.get_rect(
+                        center=(infoObject.current_w // 2, infoObject.current_h // 1.5))
+                    screen.blit(error_text, error_rect)
+                    pygame.display.flip()
+                    time.sleep(2)
+
+
+
+                # for i in range(epochs):
+                #     # randomly sample p fraction of dataset, ensuring balanced left and right classes
+                #     offline_left, offline_right = balancing(segments_left, segments_right, p=0.25)
+                    
+                #     left_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 0]
+                #     right_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 1]
+
+                #     labels_left = [0] * len(online_left)
+                #     labels_right = [1] * len(online_right)
+
+                #     ## collect real time signals
+                #     left_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 0]
+                #     right_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 1]
+
+                #     # preprocess left and right hand signals
+                #     left_segments = preprocess(left_signals)
+                #     right_segments = preprocess(right_signals)
+
+                #     # balance classes for online data
+                #     online_left, online_right = balancing(left_segments, right_segments)
+                #     left_labels = [0] * len(online_left)
+                #     right_labels = [1] * len(online_right)
+
+                #     # combine data and create data loaders
+                #     all_sigs = offline_left + offline_right + online_left + online_right
+                #     all_labels = labels_left + labels_right + left_labels + right_labels
+
+                #     train_sigs, val_sigs, train_labs, val_labs = tts(all_sigs, all_labels, test_size = 0.25)
+                #     train_ds = TData(torch.from_numpy(np.stack(train_sigs)), torch.tensor(train_labs))
+                #     val_ds = TData(torch.from_numpy(np.stack(val_sigs)), torch.tensor(val_labs))
+
+                #     train_dl = DL(train_ds, batch_size = 64, shuffle = True)
+                #     valid_dl = DL(val_ds, batch_size = 64, shuffle = True)
+
+                #     ## train and evaluate the model on the new data
+                #     model.train()
+                #     total_train_loss = 0.0
+                #     pbar = tqdm(total=len(train_dl))
+                #     for j, (batch, label) in enumerate(train_dl):
+                #         batch = batch.to(device).to(torch.float32)
+                #         label = label.to(device)
+                #         optim.zero_grad()
+                #         y_pred = model(batch)
+                #         loss = criterion(y_pred, label)
+                #         loss.backward()
+                #         optim.step()
+                #         total_train_loss += loss.item()
+                #         pbar.set_description(f"Epoch {i + 1}    loss={total_train_loss / (j + 1):0.4f}")
+                #         pbar.update(1)
+                #     pbar.close()
+                #     train_losses.append(total_train_loss/len(train_dl))
+
+                #     model.eval()
+                #     total_val_loss = 0.0
+                #     total_accuracy = 0.0
+                #     with torch.no_grad():
+                #         p_bar = tqdm(total=len(valid_dl))
+                #         for j, (batch, label) in enumerate(valid_dl):
+                #             batch = batch.to(device).to(torch.float32)
+                #             label = label.to(device)
+                #             y_pred = model(batch)
+                #             loss = criterion(y_pred, label)
+                #             prob_pred = torch.nn.functional.softmax(y_pred, -1)
+                #             acc = (prob_pred.argmax(-1) == label).float().mean()
+                #             total_val_loss += loss.item()
+                #             total_accuracy += acc.item()
+                #             p_bar.set_description(f"val_loss={total_val_loss / (j + 1):.4f}  val_acc={total_accuracy / (j + 1):.4f}")
+                #             p_bar.update(1)
+                #         p_bar.close()
+                #     val_losses.append(total_val_loss/len(valid_dl))
+                #     accs.append(total_accuracy/len(valid_dl))
+
+                #     torch.save(model.state_dict(), f"saved_models/{person}_model{i}.pt")
+                # print(batch_data)
+                # #batch_queue.addToQueue(batch_data)
+                
+                # # Clear batch data lists
+                # batch_data = []
+                # test_segments = []
+                # batch_data_new = []
 
                 clock.tick(60)
                 batch_load_example_time = 3 #seconds
