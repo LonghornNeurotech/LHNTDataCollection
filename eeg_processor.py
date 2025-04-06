@@ -96,7 +96,7 @@ class EEGProcessor:
         # UNCOMMENT THE FOLLOWING 3 LINES FOR REAL BOARD
         serial_port = find_serial_port()
         params.serial_port = serial_port
-        self.board_id = BoardIds.CYTON_DAISY_BOARD.value
+        self.board_id = BoardIds.CYTON_BOARD.value
 
         # COMMENT OUT THE FOLLOWING LINE FOR REAL BOARD
         # self.board_id = BoardIds.SYNTHETIC_BOARD.value
