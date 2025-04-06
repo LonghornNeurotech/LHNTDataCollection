@@ -2,6 +2,7 @@
 from path import Path
 import pickle
 import os
+import random
 
 def get_box_drive_path():
     base_path = Path.home() / "Box"
@@ -80,6 +81,44 @@ def save_batch_data(user_name, file_name, data, type):
     except Exception as e:
         print(f"Error: {e}")
     return
+
+def read_random_pickle_from_training(user_name):
+    
+    # Reads a random pickle file from the directory:
+    # Box\LHNT EEG\GUI Test Uploads\user_name\training
+    # and unpickles it.
+
+    # Parameters:
+    #     user_name (str): The user's name used in the directory path.
+
+    # Returns:
+    #     The unpickled object.
+
+    # Raises:
+    #     FileNotFoundError: If the directory doesn't exist or no pickle files are found.
+    
+    base_path = get_box_drive_path()  # e.g., the path to your Box drive
+    target_dir = os.path.join(base_path, "LHNT EEG", "GUI Test Uploads", user_name, "training_batch_data")
+    
+    if not os.path.exists(target_dir):
+        raise FileNotFoundError(f"Directory does not exist: {target_dir}")
+    
+    # Filter for files with a .pkl extension
+    pickle_files = [f for f in os.listdir(target_dir) if f.endswith('.pkl')]
+    if not pickle_files:
+        raise FileNotFoundError(f"No pickle files found in: {target_dir}")
+    
+    # Randomly choose one file
+    selected_file = random.choice(pickle_files)
+    file_path = os.path.join(target_dir, selected_file)
+    
+    with open(file_path, 'rb') as f:
+        data = pickle.load(f)
+    
+    print(f"Loaded {selected_file} from {target_dir}")
+    return data
+
+
 
 def save_test_data(user_name, file_name, data):
     try:

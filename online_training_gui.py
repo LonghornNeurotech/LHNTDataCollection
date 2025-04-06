@@ -12,7 +12,7 @@ import os
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split as tts
-from box import access_folder, name_match, all_sessions_match, save_batch_data, save_test_data, get_box_drive_path
+from box import access_folder, name_match, all_sessions_match, save_batch_data, save_test_data, get_box_drive_path, read_random_pickle_from_training
 from tqdm import tqdm
 from torch.utils.data import DataLoader as DL
 from torch.utils.data import TensorDataset as TData
@@ -63,8 +63,8 @@ def main():
     in_trial_menu = False
     in_after_session_menu = False
     trial_number = 1
-    total_trials = 3 # Default number of trials - changed to 2 on 1/25/2025
-    batch_size = 1 #default number of trails in a single batch - added 1/25/2025
+    total_trials = 15 # Default number of trials - changed to 2 on 1/25/2025
+    batch_size = 3 #default number of trials in a single batch - added 1/25/2025
     time_between_sessions = 180 # number of seconds to wait between sessions of data collection
     start_enable_time = time.time() # the time at/after which the start button is enabled
 
@@ -208,6 +208,7 @@ def main():
                             person = name
 
                             #selecting the random pickles to use and filling offline_sigs with the offline data
+                            
                             with zipfile.ZipFile(selected_file, "r") as zip_ref:
                                 #print(zip_ref.namelist())
                                 left_pkl_files = [f for f in zip_ref.namelist() if os.path.basename(f).startswith("left")]
@@ -568,9 +569,10 @@ def main():
                 # Always save a raw copy of the data
                 save_batch_data(name, "raw_batch", batch_data, "raw")
                 
-                # Manage the batch queue
+                # Manage the batch queueqq
                 batch_queue.put(batch_data)
                 batch_queue_new.put(batch_data_new)
+
                 if(batch_queue_new.qsize() >= 4):
                     # When the data has aged, commit it to the training folder.
                     # Each trial in this batch is split into beginning and end.
@@ -582,8 +584,11 @@ def main():
                 # Prepare online windows and labels for training run
                 all_windows = []
                 all_labels = []
+
+                # Segment the data we just collected
                 offline_left_windows = []
                 offline_right_windows = []
+
                 for idx, (beginning, end) in enumerate(batch_data_new):
                     # Remove any extra dimensions if needed
                     beginning_segment = beginning.squeeze(0)  # shape: (channels, time_points)
@@ -604,20 +609,13 @@ def main():
                         all_windows.append(window)
                         all_labels.append(label)
 
-                # All online windows have been segmented and labeled
-                print("Window shape:" + str(len(all_windows)))
-                print("Labels shape:" + str(len(all_labels)))
-                for i in range(len(all_labels)):
-                    print(str(all_labels[i]) + " " +  str(i))
-                    print("Trial length " + str(i) + ": " + str(all_windows[i].shape))
-
-                # Prepare offline windows and labels
-                print("Offline left sigs shape: " + str(offline_left_sigs.shape))
-                print("Offline left sigs shape: " + str(offline_right_sigs.shape))
+                # Segment the data from our offline session
                 offline_left_windows = sliding_window_segmentation(offline_left_sigs, window_size=125, stride = 100)
                 offline_right_windows = sliding_window_segmentation(offline_left_sigs, window_size=125, stride = 100)
-                print("Offline left windows shape: " + str(len(offline_left_windows)))
-                print("Offline right windows shape: " + str(len(offline_right_windows)))
+                print("Offline windows (L):" + str(len(offline_left_windows)))
+                print("Offline windows (R):" + str(len(offline_right_windows)))
+
+                # Segment the data from offline session
                 for window in offline_left_windows:
                         all_windows.append(window)
                         all_labels.append(0)
@@ -625,8 +623,87 @@ def main():
                         all_windows.append(window)
                         all_labels.append(1)
 
+                print("All windows, on and off line: " + str(len(all_windows)))
+                
+                # Segment the data from aged online (if we have any)
+                try:
+                    aged_data = read_random_pickle_from_training(name)
+                except FileNotFoundError:
+                    print("There's no aged data for this user yet")
+                    aged_data = None
+
+
+                # Take two random
+                if aged_data is not None:
+                    data_length = len(aged_data)
+                    even_idx, odd_idx = pick_random_even_odd_indices(data_length)
+                    even_data = aged_data[even_idx]
+                    odd_data = aged_data[odd_idx]
+
+                    # Process the even_data tuple:
+                    beginning_even, end_even = even_data
+                    beginning_segment_even = beginning_even.squeeze(0)
+                    end_segment_even = end_even.squeeze(0)
+                    beginning_windows_even = sliding_window_segmentation(beginning_segment_even, window_size=125, stride=100)
+                    end_windows_even = sliding_window_segmentation(end_segment_even, window_size=125, stride=100)
+                    print("Offline windows (E):" + str(len(beginning_windows_even)))
+                    print("Offline windows (E):" + str(len(end_windows_even)))
+
+
+                    # Process the odd_data tuple:
+                    beginning_odd, end_odd = odd_data
+                    beginning_segment_odd = beginning_odd.squeeze(0)
+                    end_segment_odd = end_odd.squeeze(0)
+                    beginning_windows_odd = sliding_window_segmentation(beginning_segment_odd, window_size=125, stride=100)
+                    end_windows_odd = sliding_window_segmentation(end_segment_odd, window_size=125, stride=100)
+                    print("Offline windows (O):" + str(len(beginning_windows_odd)))
+                    print("Offline windows (O):" + str(len(end_windows_odd)))
+
+                    
+    
+                    # for window in list(beginning_windows_even) + list(end_windows_even):
+                    #     all_windows.append(window)
+                    #     all_labels.append(0)  # Left
+                    # for window in list(beginning_windows_odd) + list(end_windows_odd):
+                    #     all_windows.append(window)
+                    #     all_labels.append(1)  # Right
+
+                    for window in list(beginning_windows_even)[:6]:
+                        all_windows.append(window)
+                        all_labels.append(0)  # Left label
+
+                    for window in list(end_windows_even)[:6]:
+                        all_windows.append(window)
+                        all_labels.append(0)  # Left label
+
+                    # For right (odd) data, take 4 windows from beginning and 4 windows from end
+                    for window in list(beginning_windows_odd)[:6]:
+                        all_windows.append(window)
+                        all_labels.append(1)  # Right label
+
+                    for window in list(end_windows_odd)[:6]:
+                        all_windows.append(window)
+                        all_labels.append(1)  # Right label
+
+
                 all_windows_np = np.stack(all_windows)  # shape: (num_windows, channels, 125)
                 all_labels_np = np.array(all_labels)      # shape: (num_windows,)
+
+                # All online windows have been segmented and labeled
+                print("Window shape:" + str(len(all_windows)))
+                print("Labels shape:" + str(len(all_labels)))
+                # for i in range(len(all_labels)):
+                #     print(str(all_labels[i]) + " " +  str(i))
+                #     print("Trial length " + str(i) + ": " + str(all_windows[i].shape))
+
+                # Prepare offline windows and labels
+                # print("Offline left sigs shape: " + str(offline_left_sigs.shape))
+                # print("Offline left sigs shape: " + str(offline_right_sigs.shape))
+
+                # print("Offline left windows shape: " + str(len(offline_left_windows)))
+                # print("Offline right windows shape: " + str(len(offline_right_windows)))
+
+
     
                 print("All windows, on and off line: " + str(len(all_windows)))
                 print("All windows shape:", all_windows_np.shape)
@@ -696,118 +773,12 @@ def main():
                     os.makedirs(models_folder, exist_ok=True)  # Create the folder if it doesn't exist
 
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-                    # Assume val_accuracy is computed during validation
                     model_filename = f"valacc{total_accuracy:.2f}_{name}_model_{timestamp}_epoch{epoch:02d}.pt"
                     model_path = os.path.join(models_folder, model_filename)
                     torch.save(model.state_dict(), model_path)
 
-                # train model with batch_data list
-                # epochs = 10
-                # criterion = torch.nn.CrossEntropyLoss()
-                # optim = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
-                # train_losses = []
-                # val_losses = []
-                # accs = []
+        
 
-                # preprocess left hand and right hand signals
-                # segments_left = preprocess(offline_left_sigs)
-                # segments_right = preprocess(offline_right_sigs)
-                # #online_left = batch_data[:, ]
-
-                # for i, trial_tuple in enumerate(batch_data):
-                #     beginning, end = trial_tuple
-                #     if i%2 == 0: # Even Index = Left
-                #         left_signals.
-
-                # for i in range(epochs):
-                #     # Randomly sample p fraction of dataset, ensuring balanced left and right classes
-                #     offline_left, offline_right = balancing(segments_left, segments_right, p=0.25)
-                    
-                #     # Extract left and right segments from batch_data_new 
-                #     # This handles the split segments structure (trial_beginning, trial_end)
-                #     left_signals = []
-                #     right_signals = []
-                    
-                #     # Process each tuple of (beginning, end) segments
-                #     for idx, (beginning, end) in enumerate(batch_data_new):
-                #         if idx % 2 == 0:  # Even indices are left hand trials
-                #             # Add both parts separately to maintain their individual characteristics
-                #             left_signals.append(beginning)
-                #             left_signals.append(end)
-                #         else:  # Odd indices are right hand trials
-                #             right_signals.append(beginning)
-                #             right_signals.append(end)
-                    
-                #     # Preprocess left and right hand signals
-                #     left_segments = preprocess(left_signals)
-                #     right_segments = preprocess(right_signals)
-                    
-                #     # Balance classes for online data
-                #     online_left, online_right = balancing(left_segments, right_segments)
-                    
-                #     # Create labels for all segments
-                #     offline_left_labels = [0] * len(offline_left)
-                #     offline_right_labels = [1] * len(offline_right)
-                #     online_left_labels = [0] * len(online_left)
-                #     online_right_labels = [1] * len(online_right)
-                    
-                #     # Combine all data and create data loaders
-                #     all_sigs = offline_left + offline_right + online_left + online_right
-                #     all_labels = offline_left_labels + offline_right_labels + online_left_labels + online_right_labels
-                    
-                #     # Split into training and validation sets
-                #     train_sigs, val_sigs, train_labs, val_labs = tts(all_sigs, all_labels, test_size=0.25)
-                #     # Check shapes before stacking
-                #     for sig in train_sigs:
-                #         print("Train signal shape:", sig.shape)
-                #     assert len(train_sigs) > 0, "No training signals found!"
-
-                #     train_ds = TData(torch.from_numpy(np.stack(train_sigs)), torch.tensor(train_labs))
-                #     val_ds = TData(torch.from_numpy(np.stack(val_sigs)), torch.tensor(val_labs))
-                    
-                #     train_dl = DL(train_ds, batch_size=64, shuffle=True)
-                #     valid_dl = DL(val_ds, batch_size=64, shuffle=True)
-                    
-                #     # Train and evaluate the model on the new data
-                #     model.train()
-                #     total_train_loss = 0.0
-                #     pbar = tqdm(total=len(train_dl))
-                #     for j, (batch, label) in enumerate(train_dl):
-                #         batch = batch.to(device).to(torch.float32)
-                #         label = label.to(device)
-                #         optim.zero_grad()
-                #         y_pred = model(batch)
-                #         loss = criterion(y_pred, label)
-                #         loss.backward()
-                #         optim.step()
-                #         total_train_loss += loss.item()
-                #         pbar.set_description(f"Epoch {i + 1}    loss={total_train_loss / (j + 1):0.4f}")
-                #         pbar.update(1)
-                #     pbar.close()
-                #     train_losses.append(total_train_loss/len(train_dl))
-                    
-                #     model.eval()
-                #     total_val_loss = 0.0
-                #     total_accuracy = 0.0
-                #     with torch.no_grad():
-                #         p_bar = tqdm(total=len(valid_dl))
-                #         for j, (batch, label) in enumerate(valid_dl):
-                #             batch = batch.to(device).to(torch.float32)
-                #             label = label.to(device)
-                #             y_pred = model(batch)
-                #             loss = criterion(y_pred, label)
-                #             prob_pred = torch.nn.functional.softmax(y_pred, -1)
-                #             acc = (prob_pred.argmax(-1) == label).float().mean()
-                #             total_val_loss += loss.item()
-                #             total_accuracy += acc.item()
-                #             p_bar.set_description(f"val_loss={total_val_loss / (j + 1):.4f}  val_acc={total_accuracy / (j + 1):.4f}")
-                #             p_bar.update(1)
-                #         p_bar.close()
-                #     val_losses.append(total_val_loss/len(valid_dl))
-                #     accs.append(total_accuracy/len(valid_dl))
-                    
-                #     torch.save(model.state_dict(), f"saved_models/{person}_model{i}.pt")
 
                 print(batch_data_new)  # Print the batch_data_new instead of batch_data
 
@@ -865,88 +836,6 @@ def main():
                     pygame.display.flip()
                     time.sleep(2)
 
-
-
-                # for i in range(epochs):
-                #     # randomly sample p fraction of dataset, ensuring balanced left and right classes
-                #     offline_left, offline_right = balancing(segments_left, segments_right, p=0.25)
-                    
-                #     left_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 0]
-                #     right_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 1]
-
-                #     labels_left = [0] * len(online_left)
-                #     labels_right = [1] * len(online_right)
-
-                #     ## collect real time signals
-                #     left_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 0]
-                #     right_signals = [sig for i, sig in enumerate(batch_data) if i % 2 == 1]
-
-                #     # preprocess left and right hand signals
-                #     left_segments = preprocess(left_signals)
-                #     right_segments = preprocess(right_signals)
-
-                #     # balance classes for online data
-                #     online_left, online_right = balancing(left_segments, right_segments)
-                #     left_labels = [0] * len(online_left)
-                #     right_labels = [1] * len(online_right)
-
-                #     # combine data and create data loaders
-                #     all_sigs = offline_left + offline_right + online_left + online_right
-                #     all_labels = labels_left + labels_right + left_labels + right_labels
-
-                #     train_sigs, val_sigs, train_labs, val_labs = tts(all_sigs, all_labels, test_size = 0.25)
-                #     train_ds = TData(torch.from_numpy(np.stack(train_sigs)), torch.tensor(train_labs))
-                #     val_ds = TData(torch.from_numpy(np.stack(val_sigs)), torch.tensor(val_labs))
-
-                #     train_dl = DL(train_ds, batch_size = 64, shuffle = True)
-                #     valid_dl = DL(val_ds, batch_size = 64, shuffle = True)
-
-                #     ## train and evaluate the model on the new data
-                #     model.train()
-                #     total_train_loss = 0.0
-                #     pbar = tqdm(total=len(train_dl))
-                #     for j, (batch, label) in enumerate(train_dl):
-                #         batch = batch.to(device).to(torch.float32)
-                #         label = label.to(device)
-                #         optim.zero_grad()
-                #         y_pred = model(batch)
-                #         loss = criterion(y_pred, label)
-                #         loss.backward()
-                #         optim.step()
-                #         total_train_loss += loss.item()
-                #         pbar.set_description(f"Epoch {i + 1}    loss={total_train_loss / (j + 1):0.4f}")
-                #         pbar.update(1)
-                #     pbar.close()
-                #     train_losses.append(total_train_loss/len(train_dl))
-
-                #     model.eval()
-                #     total_val_loss = 0.0
-                #     total_accuracy = 0.0
-                #     with torch.no_grad():
-                #         p_bar = tqdm(total=len(valid_dl))
-                #         for j, (batch, label) in enumerate(valid_dl):
-                #             batch = batch.to(device).to(torch.float32)
-                #             label = label.to(device)
-                #             y_pred = model(batch)
-                #             loss = criterion(y_pred, label)
-                #             prob_pred = torch.nn.functional.softmax(y_pred, -1)
-                #             acc = (prob_pred.argmax(-1) == label).float().mean()
-                #             total_val_loss += loss.item()
-                #             total_accuracy += acc.item()
-                #             p_bar.set_description(f"val_loss={total_val_loss / (j + 1):.4f}  val_acc={total_accuracy / (j + 1):.4f}")
-                #             p_bar.update(1)
-                #         p_bar.close()
-                #     val_losses.append(total_val_loss/len(valid_dl))
-                #     accs.append(total_accuracy/len(valid_dl))
-
-                #     torch.save(model.state_dict(), f"saved_models/{person}_model{i}.pt")
-                # print(batch_data)
-                # #batch_queue.addToQueue(batch_data)
-                
-                # # Clear batch data lists
-                # batch_data = []
-                # test_segments = []
-                # batch_data_new = []
 
                 clock.tick(60)
                 batch_load_example_time = 3 #seconds
@@ -1026,6 +915,19 @@ def main():
                         in_trial_menu = False
                     elif event.key == pygame.K_r:
                         in_trial_menu = False
+
+def pick_random_even_odd_indices(data_length):
+    """Return one random even index and one random odd index given data_length."""
+    even_indices = [i for i in range(data_length) if i % 2 == 0]
+    odd_indices = [i for i in range(data_length) if i % 2 == 1]
+    
+    # Ensure that both lists are non-empty.
+    if not even_indices or not odd_indices:
+        raise ValueError("Data length must contain at least one even and one odd index.")
+    
+    chosen_even = random.choice(even_indices)
+    chosen_odd = random.choice(odd_indices)
+    return chosen_even, chosen_odd
 
 
 if __name__ == "__main__":
