@@ -15,6 +15,7 @@ import pandas as pd
 from boxsdk import Client, OAuth2
 import zipfile
 import os
+import random
 
 def find_serial_port():
     """
@@ -66,8 +67,8 @@ class EEGProcessor:
         params = BrainFlowInputParams()
         #serial_port = find_serial_port()
         #params.serial_port = serial_port
-        #self.board_id = BoardIds.CYTON_DAISY_BOARD.value
-        self.board_id = BoardIds.CYTON_DAISY_BOARD.value
+        self.board_id = BoardIds.SYNTHETIC_BOARD.value
+        #self.board_id = BoardIds.CYTON_BOARD.value
         self.board = BoardShim(self.board_id, params)
         self.board.prepare_session()
         self.board.start_stream()
@@ -276,8 +277,11 @@ def main():
     exercise_bool_boxes.append(yes_exercise)
     exercise_bool_boxes.append(no_exercise)
     
-    direction = 'left'  # Start with 'left' and alternate
 
+    direction_list = ['left', 'right', 'up' ,'down']
+    random.shuffle(direction_list)
+    direction_index = 0
+    direction = direction_list[direction_index]  # Start with random direction and proceed through list
 
     while running:
 
@@ -580,7 +584,7 @@ def main():
         elif in_input:
             # Display Input Menu for Setting Number of Trials
             screen.fill(BLACK)
-            prompt_text = medium_font.render("Enter Number of Recordings (Even):", True, WHITE)
+            prompt_text = medium_font.render("Enter Number of Recordings (mulitple of 4):", True, WHITE)
             input_display = medium_font.render(input_text, True, GREEN if not input_error else RED)
             instructions_text = small_font.render("Press Enter to Confirm", True, WHITE)
 
@@ -608,8 +612,8 @@ def main():
                         if input_text.isdigit():
                             entered_number = int(input_text)
                             if entered_number > 0:
-                                if entered_number % 2 != 0:
-                                    entered_number += 1  # Make it even
+                                if entered_number % 4 != 0:
+                                    entered_number += 4 - (entered_number % 4) #raise to ceiling of 4 trials
                                     input_error = True
                                 total_trials = entered_number
                                 in_input = False
@@ -727,6 +731,7 @@ def main():
             arrow_color = WHITE
             arrow_length = infoObject.current_w // 10  
             arrow_width = infoObject.current_h // 40
+            arrow_x_offset = infoObject.current_w // 10
             arrow_y_offset = infoObject.current_h // 10
 
             # Clear screen but keep green bars and trial info
@@ -744,6 +749,18 @@ def main():
                     (center_pos[0], center_pos[1] - arrow_y_offset - arrow_width),
                     (center_pos[0], center_pos[1] - arrow_y_offset + arrow_width)
                 ])
+            elif direction == 'up':
+                pygame.draw.polygon(screen, arrow_color, [
+                    (center_pos[0] - arrow_x_offset, center_pos[1] - arrow_length),
+                    (center_pos[0] - arrow_x_offset - arrow_width, center_pos[1]),
+                    (center_pos[0] - arrow_x_offset + arrow_width, center_pos[1])
+                ])
+            elif direction == 'down':
+                pygame.draw.polygon(screen, arrow_color, [
+                    (center_pos[0] - arrow_x_offset, center_pos[1] + arrow_length),
+                    (center_pos[0] - arrow_x_offset - arrow_width, center_pos[1]),
+                    (center_pos[0] - arrow_x_offset + arrow_width, center_pos[1])
+                ]) 
             else:
                 pygame.draw.polygon(screen, arrow_color, [
                     (center_pos[0] + arrow_length, center_pos[1] - arrow_y_offset),
@@ -800,18 +817,11 @@ def main():
                 # Redraw trial info
                 screen.blit(trial_info, trial_info_rect)
 
-                # Redraw Arrow
-                if direction == 'left':
-                    pygame.draw.polygon(screen, arrow_color, [
-                        (center_pos[0] - arrow_length, center_pos[1] - arrow_y_offset),
-                        (center_pos[0], center_pos[1] - arrow_y_offset - arrow_width),
-                        (center_pos[0], center_pos[1] - arrow_y_offset + arrow_width)
-                    ])
-                    # Calculate current length of the loading bar
-                    # From center to left green bar
-                    max_length = center_pos[0] - (left_green_bar_pos[0] + green_bar_width)
-                    current_length = loading_progress * max_length
+                loading_bar_length = infoObject.current_h // 3
+                current_length = loading_progress * loading_bar_length
 
+                # loading bars
+                if direction == 'left':
                     # Draw loading bar moving left from center
                     pygame.draw.rect(screen, WHITE, (
                         center_pos[0] - current_length,  # Start at center and move left
@@ -819,17 +829,23 @@ def main():
                         current_length,
                         loading_bar_thickness
                     ))
+                elif direction == 'up':
+                    # Draw loading bar moving up from center
+                    pygame.draw.rect(screen, WHITE, (
+                        center_pos[0] - loading_bar_thickness // 2,
+                        center_pos[1] - current_length,  # Start at center and move up
+                        loading_bar_thickness,
+                        current_length
+                    ))
+                elif direction == 'down':
+                    # Draw loading bar moving down from center
+                    pygame.draw.rect(screen, WHITE, (
+                        center_pos[0] - loading_bar_thickness // 2,
+                        center_pos[1],  # Start at center and move down
+                        loading_bar_thickness,
+                        current_length
+                    ))
                 else:
-                    pygame.draw.polygon(screen, arrow_color, [
-                        (center_pos[0] + arrow_length, center_pos[1] - arrow_y_offset),
-                        (center_pos[0], center_pos[1] - arrow_y_offset - arrow_width),
-                        (center_pos[0], center_pos[1] - arrow_y_offset + arrow_width)
-                    ])
-                    # Calculate current length of the loading bar
-                    # From center to right green bar
-                    max_length = (right_green_bar_pos[0]) - center_pos[0]
-                    current_length = loading_progress * max_length
-
                     # Draw loading bar moving right from center
                     pygame.draw.rect(screen, WHITE, (
                         center_pos[0],  # Start at center and move right
@@ -881,12 +897,13 @@ def main():
             if not running:
                 break
 
-            # Alternate Direction
-            if direction == 'left':
-                direction = 'right'
-            else:
-                direction = 'left'
+            if direction_index < 3:
+                direction_index += 1
+            else: #if direction_index was 3, then reached end of all 4 directions --> reset 
+                random.shuffle(direction_list)
+                direction_index = 0
 
+            direction = direction_list[direction_index]
             trial_number += 1
 
             # Check if all trials are completed
