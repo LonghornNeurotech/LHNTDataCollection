@@ -74,10 +74,12 @@ class EEGProcessor:
         BoardShim.enable_dev_board_logger()
         params = BrainFlowInputParams()
         # TODO: Add serial port detection back if needed for Cyton
-        # serial_port = find_serial_port()
-        # if serial_port and board_id_to_use == BoardIds.CYTON_BOARD.value:
-        #     params.serial_port = serial_port
-        # else:
+        serial_port = find_serial_port()
+        if serial_port and board_id_to_use == BoardIds.CYTON_BOARD.value:
+            params.serial_port = serial_port
+        elif board_id_to_use == BoardIds.CYTON_BOARD.value: # Added check for Cyton even if port not found
+            print("Warning: Serial port not automatically found for Cyton board. Please ensure it's connected.")
+        # else: # Removed redundant else
         #     print("Warning: Serial port not automatically found or using synthetic board.")
 
         self.board_id = board_id_to_use # Use passed board_id
