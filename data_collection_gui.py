@@ -16,6 +16,7 @@ from boxsdk import Client, OAuth2
 import zipfile
 import os
 import random
+from box import get_box_drive_path
 
 def find_serial_port():
     """
@@ -55,10 +56,11 @@ def draw_plus_sign(screen, center_pos, plus_length, thickness, color):
 
 def create_user_directory(first_name, last_name, session_num):
     dir_name = first_name + '_' + last_name + '_' + 'Session' + str(session_num)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    new_dir_path = os.path.join(script_dir, dir_name)
+    box_drive_path = get_box_drive_path();
+    base_folder = os.path.join(box_drive_path, "LHNT EEG", "4DF_Data")    
+    new_dir_path = os.path.join(base_folder, dir_name)
     os.mkdir(new_dir_path)
-    return dir_name
+    return new_dir_path
 
 class EEGProcessor:
     def __init__(self):
@@ -157,9 +159,7 @@ def save_data(eeg_processor, metadata, direction, trial_num, directory):
     #Establish a filename [direction]_[trial number].pkl
     filename = direction + '_' + str(trial_num) + '.pkl'
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    intermediate = os.path.join(script_dir, directory)
-    filepath = os.path.join(intermediate, filename)
+    filepath = os.path.join(directory, filename)
 
     #Dump signal and metadata into pickle file - this saves into the folder that we created earlier
     with open(filepath, 'wb') as f:
@@ -193,7 +193,7 @@ def main():
     in_buffer_screen = False
     in_after_session_menu = False
     trial_number = 1
-    total_trials = 20 # Default number of trials
+    total_trials = 8 # Default number of trials
     time_between_sessions = 180 # number of seconds to wait between sessions of data collection
     start_enable_time = time.time() # the time at/after which the start button is enabled
     saved_questionnaire_data = False
@@ -707,7 +707,10 @@ def main():
             screen.blit(trial_info, trial_info_rect)
 
             # Draw Focus Period '+' sign
-            draw_plus_sign(screen, center_pos, plus_length, loading_bar_thickness, WHITE)
+            #draw_plus_sign(screen, center_pos, plus_length, loading_bar_thickness, WHITE)
+            plus_text = large_font.render("+", True, WHITE)
+            plus_rect = plus_text.get_rect(center=center_pos)
+            screen.blit(plus_text, plus_rect)
             pygame.display.flip()
 
             # Collect data during focus period
@@ -723,6 +726,8 @@ def main():
                             running = False
                             break
                 clock.tick(60)
+
+            screen.fill(BLACK) # remove the plus sign
 
             if not running:
                 break
@@ -768,7 +773,10 @@ def main():
                     (center_pos[0], center_pos[1] - arrow_y_offset + arrow_width)
                 ])
 
-            draw_plus_sign(screen, center_pos, plus_length, loading_bar_thickness, WHITE)
+            #draw_plus_sign(screen, center_pos, plus_length, loading_bar_thickness, WHITE)
+            plus_text = large_font.render("+", True, WHITE)
+            plus_rect = plus_text.get_rect(center=center_pos)
+            screen.blit(plus_text, plus_rect)
 
             pygame.display.flip()
 
@@ -854,7 +862,10 @@ def main():
                         loading_bar_thickness
                     ))
 
-                draw_plus_sign(screen, center_pos, plus_length, loading_bar_thickness, WHITE)
+                #draw_plus_sign(screen, center_pos, plus_length, loading_bar_thickness, WHITE)
+                plus_text = large_font.render("+", True, WHITE)
+                plus_rect = plus_text.get_rect(center=center_pos)
+                screen.blit(plus_text, plus_rect)
 
                 pygame.display.flip()
                 save_data(eeg_processor, metadata, direction, trial_number, directory)
