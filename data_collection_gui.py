@@ -53,6 +53,33 @@ def draw_plus_sign(screen, center_pos, plus_length, thickness, color):
                      (center_pos[0], center_pos[1] + plus_length // 2),
                      thickness)
 
+def draw_arrows(screen, direction, center_pos, arrow_color, arrow_length, arrow_y_offset, arrow_x_offset, arrow_width):
+    if direction == 'left':
+                pygame.draw.polygon(screen, arrow_color, [
+                    (center_pos[0] - arrow_length, center_pos[1] - arrow_y_offset),
+                    (center_pos[0], center_pos[1] - arrow_y_offset - arrow_width),
+                    (center_pos[0], center_pos[1] - arrow_y_offset + arrow_width)
+                ])
+    elif direction == 'up':
+        pygame.draw.polygon(screen, arrow_color, [
+            (center_pos[0] - arrow_x_offset, center_pos[1] - arrow_length),
+            (center_pos[0] - arrow_x_offset - arrow_width, center_pos[1]),
+            (center_pos[0] - arrow_x_offset + arrow_width, center_pos[1])
+        ])
+    elif direction == 'down':
+        pygame.draw.polygon(screen, arrow_color, [
+            (center_pos[0] - arrow_x_offset, center_pos[1] + arrow_length),
+            (center_pos[0] - arrow_x_offset - arrow_width, center_pos[1]),
+            (center_pos[0] - arrow_x_offset + arrow_width, center_pos[1])
+        ]) 
+    else:
+        pygame.draw.polygon(screen, arrow_color, [
+            (center_pos[0] + arrow_length, center_pos[1] - arrow_y_offset),
+            (center_pos[0], center_pos[1] - arrow_y_offset - arrow_width),
+            (center_pos[0], center_pos[1] - arrow_y_offset + arrow_width)
+        ])
+
+
 
 def create_user_directory(first_name, last_name, session_num):
     dir_name = first_name + '_' + last_name + '_' + 'Session' + str(session_num)
@@ -212,13 +239,15 @@ def main():
     green_bar_height = infoObject.current_h // 3
     loading_bar_thickness = infoObject.current_h // 30
     arrow_y_offset = infoObject.current_h // 10
-
-    # Positions for Green Bars
-    left_green_bar_pos = (infoObject.current_w // 50, infoObject.current_h // 2 - green_bar_height // 2)
-    right_green_bar_pos = (infoObject.current_w - infoObject.current_w // 50 - green_bar_width, infoObject.current_h // 2 - green_bar_height // 2)
-
+    
     # Center Position
     center_pos = (infoObject.current_w // 2, infoObject.current_h // 2)
+
+    # Positions for Green Bars
+    left_green_bar_pos = ((center_pos[0] - (infoObject.current_h // 3) - green_bar_width), (infoObject.current_h // 2 - green_bar_height // 2))
+    right_green_bar_pos = ((center_pos[0] + (infoObject.current_h // 3) + green_bar_width/4 - 5), (infoObject.current_h // 2 - green_bar_height // 2))
+    top_green_bar_pos = (center_pos[0]-150, center_pos[1]-(infoObject.current_h // 3) - green_bar_width)
+    bottom_green_bar_pos = (center_pos[0]-150, center_pos[1]+(infoObject.current_h // 3))
 
     # Plus sign settings
     plus_length = infoObject.current_h // 15  # Adjust as needed
@@ -700,6 +729,8 @@ def main():
             # Redraw green bars
             pygame.draw.rect(screen, GREEN, (*left_green_bar_pos, green_bar_width, green_bar_height))
             pygame.draw.rect(screen, GREEN, (*right_green_bar_pos, green_bar_width, green_bar_height))
+            pygame.draw.rect(screen, GREEN, (*bottom_green_bar_pos, green_bar_height, green_bar_width))
+            pygame.draw.rect(screen, GREEN, (*top_green_bar_pos, green_bar_height, green_bar_width))
 
             # Draw Current Trial Info
             trial_info = small_font.render(f"Trial {trial_number}/{total_trials}", True, WHITE)
@@ -728,6 +759,7 @@ def main():
                 clock.tick(60)
 
             screen.fill(BLACK) # remove the plus sign
+            pygame.display.flip()
 
             if not running:
                 break
@@ -744,6 +776,9 @@ def main():
             # Redraw green bars
             pygame.draw.rect(screen, GREEN, (*left_green_bar_pos, green_bar_width, green_bar_height))
             pygame.draw.rect(screen, GREEN, (*right_green_bar_pos, green_bar_width, green_bar_height))
+            pygame.draw.rect(screen, GREEN, (*bottom_green_bar_pos, green_bar_height, green_bar_width))
+            pygame.draw.rect(screen, GREEN, (*top_green_bar_pos, green_bar_height, green_bar_width))
+            draw_arrows(screen, direction, center_pos, arrow_color, arrow_length, arrow_y_offset, arrow_x_offset, arrow_width)
             # Redraw trial info
             screen.blit(trial_info, trial_info_rect)
 
@@ -794,6 +829,9 @@ def main():
                             break
                 clock.tick(60)
 
+            screen.fill(BLACK) 
+            pygame.display.flip()
+
             if not running:
                 break
 
@@ -822,6 +860,9 @@ def main():
                 # Redraw green bars
                 pygame.draw.rect(screen, GREEN, (*left_green_bar_pos, green_bar_width, green_bar_height))
                 pygame.draw.rect(screen, GREEN, (*right_green_bar_pos, green_bar_width, green_bar_height))
+                pygame.draw.rect(screen, GREEN, (*bottom_green_bar_pos, green_bar_height, green_bar_width))
+                pygame.draw.rect(screen, GREEN, (*top_green_bar_pos, green_bar_height, green_bar_width))                
+                draw_arrows(screen, direction, center_pos, arrow_color, arrow_length, arrow_y_offset, arrow_x_offset, arrow_width)
                 # Redraw trial info
                 screen.blit(trial_info, trial_info_rect)
 
@@ -862,14 +903,12 @@ def main():
                         loading_bar_thickness
                     ))
 
-                #draw_plus_sign(screen, center_pos, plus_length, loading_bar_thickness, WHITE)
-                plus_text = large_font.render("+", True, WHITE)
-                plus_rect = plus_text.get_rect(center=center_pos)
-                screen.blit(plus_text, plus_rect)
 
                 pygame.display.flip()
-                save_data(eeg_processor, metadata, direction, trial_number, directory)
                 clock.tick(60)
+            # Save right after the loop
+            print("Calling save data, trial number = " + str(trial_number))
+            save_data(eeg_processor, metadata, direction, trial_number, directory)
 
             if not running:
                 break
@@ -896,6 +935,9 @@ def main():
                 # Redraw green bars
                 pygame.draw.rect(screen, GREEN, (*left_green_bar_pos, green_bar_width, green_bar_height))
                 pygame.draw.rect(screen, GREEN, (*right_green_bar_pos, green_bar_width, green_bar_height))
+                pygame.draw.rect(screen, GREEN, (*bottom_green_bar_pos, green_bar_height, green_bar_width))
+                pygame.draw.rect(screen, GREEN, (*top_green_bar_pos, green_bar_height, green_bar_width))
+
                 # Redraw trial info
                 screen.blit(trial_info, trial_info_rect)
 
