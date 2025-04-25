@@ -113,8 +113,8 @@ class EEGProcessor:
 
         # we set raw window size to 17 seconds
         self.window_size_raw = int(17 * self.sampling_rate)
-        self.lowcut = 1.0
-        self.highcut = 50.0
+        self.lowcut = 5.0
+        self.highcut = 35.0
         self.notch = 60.0
 
         # Get EEG channels
@@ -163,6 +163,10 @@ class EEGProcessor:
                 # Notch filter
                 b, a = iirnotch(self.notch, 30, fs=self.sampling_rate)
                 channel_data = lfilter(b, a, channel_data)
+
+                # Z-score normalization
+                channel_data = (channel_data - np.mean(channel_data)) / np.std(channel_data) 
+                # guessing that channel_data is a 1-D array, hopefully that is true
 
                 # add channel dimension to channel_data
                 new_processed_data[i, :] =  channel_data
