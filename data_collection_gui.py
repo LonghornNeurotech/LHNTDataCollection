@@ -64,10 +64,12 @@ class EEGProcessor:
         # Initialize BrainFlow
         BoardShim.enable_dev_board_logger()
         params = BrainFlowInputParams()
-        #serial_port = find_serial_port()
-        #params.serial_port = serial_port
-        #self.board_id = BoardIds.CYTON_DAISY_BOARD.value
-        self.board_id = BoardIds.CYTON_DAISY_BOARD.value
+        serial_port = find_serial_port()
+        params.serial_port = serial_port
+        #self.board_id = BoardIds.SYNTHETIC_BOARD.value
+
+        # 8 Channel Board
+        self.board_id = BoardIds.CYTON_BOARD.value
         self.board = BoardShim(self.board_id, params)
         self.board.prepare_session()
         self.board.start_stream()
@@ -101,7 +103,7 @@ class EEGProcessor:
         """
         Returns the most recent 7 seconds of processed EEG data.
 
-        The data is bandpass filtered, notch filtered, and z-scored.
+        The data is bandpass and notch filtered..
         Each data point is filtered only once.
         """
         data = self.board.get_board_data() 
@@ -166,13 +168,27 @@ def save_data(eeg_processor, metadata, direction, trial_num, directory):
     
 
 def main():
-    session_num = input("Enter the session number: ")
+    #session_num = input("Enter the session number: ")
+    
+    if len(sys.argv) > 1:
+        session_num = sys.argv[1]  # whatever you type after the script name
+    else:
+        session_num = input("Enter the session number: ")
+
     eeg_processor = EEGProcessor()
+
 
     # Initialize Pygame
     pygame.init()
     infoObject = pygame.display.Info()
-    screen = pygame.display.set_mode((infoObject.current_w, infoObject.current_h), pygame.FULLSCREEN)
+    
+    screen = pygame.display.set_mode((0, 0), pygame.NOFRAME)
+    pygame.display.set_caption("Motor Imagery Task")
+
+    # Now query the actual window size
+    window_w, window_h = screen.get_size()
+    center_pos = (window_w // 2, window_h // 2)
+
     pygame.display.set_caption("Motor Imagery Task")
 
     # Colors
