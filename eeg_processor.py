@@ -15,18 +15,21 @@ def find_serial_port():
     """
     system = platform.system()
     ports = list(serial.tools.list_ports.comports())
+    print(f"Available ports: {[p.device for p in ports]}")
     
     for port in ports:
-        if system == "Darwin":  # macOS
-            if any(identifier in port.device.lower() for identifier in ["usbserial", "cu.usbmodem", "tty.usbserial"]):
-                return port.device
-        elif system == "Windows":
-            if "com" in port.device.lower():
-                return port.device
-        elif system == "Linux":
-            if "ttyUSB" in port.device or "ttyACM" in port.device:
-                return port.device
-    
+        if 'CH340' in port.description or 'USB' in port.description:
+            print(f"Found potential EEG device: {port.device}")
+            if system == "Darwin":  # macOS
+                if any(identifier in port.device.lower() for identifier in ["usbserial", "cu.usbmodem", "tty.usbserial"]):
+                    return port.device
+            elif system == "Windows":
+                if "com" in port.device.lower():
+                    return port.device
+            elif system == "Linux":
+                if "ttyUSB" in port.device or "ttyACM" in port.device:
+                    return port.device
+    print("WARNING: No EEG device detected. Using synthetic board.")
     return None
 
 
@@ -95,11 +98,16 @@ class EEGProcessor:
 
         # UNCOMMENT THE FOLLOWING 3 LINES FOR REAL BOARD
         serial_port = find_serial_port()
-        params.serial_port = serial_port
-        self.board_id = BoardIds.CYTON_BOARD.value
+        if serial_port is None:
+            print("No hardware found - using synthetic board for testing")
+            self.board_id = BoardIds.SYNTHETIC_BOARD.value
+            params = BrainFlowInputParams()
+        else:
+            params.serial_port = serial_port
+            self.board_id = BoardIds.CYTON_BOARD.value
 
         # COMMENT OUT THE FOLLOWING LINE FOR REAL BOARD
-        # self.board_id = BoardIds.SYNTHETIC_BOARD.value
+        #self.board_id = BoardIds.SYNTHETIC_BOARD.value
 
         self.board = BoardShim(self.board_id, params)
         self.board.prepare_session()
