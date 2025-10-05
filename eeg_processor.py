@@ -96,7 +96,6 @@ class EEGProcessor:
         BoardShim.enable_dev_board_logger()
         params = BrainFlowInputParams()
 
-        # UNCOMMENT THE FOLLOWING 3 LINES FOR REAL BOARD
         serial_port = find_serial_port()
         if serial_port is None:
             print("No hardware found - using synthetic board for testing")
@@ -106,8 +105,6 @@ class EEGProcessor:
             params.serial_port = serial_port
             self.board_id = BoardIds.CYTON_BOARD.value
 
-        # COMMENT OUT THE FOLLOWING LINE FOR REAL BOARD
-        #self.board_id = BoardIds.SYNTHETIC_BOARD.value
 
         self.board = BoardShim(self.board_id, params)
         self.board.prepare_session()
@@ -166,7 +163,7 @@ class EEGProcessor:
 
                 # Bandpass filter
                 b, a = butter(2, [self.lowcut, self.highcut], btype='band', fs=self.sampling_rate)
-                channel_data = lfilter(b, a, channel_data)
+                channel_data = lfilter(b, a, channel_data) #scipi.signal.filfilt implementation for zero order
                 
                 # Notch filter
                 b, a = iirnotch(self.notch, 30, fs=self.sampling_rate)
