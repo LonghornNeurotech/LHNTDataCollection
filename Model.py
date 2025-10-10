@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PCNN_3Branch(nn.Module):
-    def __init__(self, input_channels=16, num_classes=2, input_length=125):
+    def __init__(self, input_channels=8, num_classes=2, input_length=125):
         super().__init__()
 
 

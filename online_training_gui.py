@@ -31,8 +31,8 @@ def main():
     batch_queue_new = queue.Queue(maxsize=4)
     # load model being used
     model = PCNN_3Branch()
-    checkpoint = torch.load("matt_pcnn.pth", map_location=torch.device('cpu'), weights_only=False)
-    model.load_state_dict(checkpoint.state_dict())
+    #checkpoint = torch.load("matt_pcnn.pth", map_location=torch.device('cpu'), weights_only=False)
+    #model.load_state_dict(checkpoint.state_dict())
     model = model.float()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.to(device)  # Move the model to the selected device

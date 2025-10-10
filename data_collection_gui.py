@@ -65,11 +65,13 @@ class EEGProcessor:
         BoardShim.enable_dev_board_logger()
         params = BrainFlowInputParams()
         serial_port = find_serial_port()
-        params.serial_port = serial_port
-        #self.board_id = BoardIds.SYNTHETIC_BOARD.value
-
-        # 8 Channel Board
-        self.board_id = BoardIds.CYTON_BOARD.value
+        if serial_port is None:
+            print("No hardware found - using synthetic board for testing")
+            self.board_id = BoardIds.SYNTHETIC_BOARD.value
+            params = BrainFlowInputParams()
+        else:
+            params.serial_port = serial_port
+            self.board_id = BoardIds.CYTON_BOARD.value
         self.board = BoardShim(self.board_id, params)
         self.board.prepare_session()
         self.board.start_stream()
