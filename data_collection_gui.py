@@ -52,12 +52,39 @@ def draw_plus_sign(screen, center_pos, plus_length, thickness, color):
                      thickness)
 
 
-def create_user_directory(first_name, last_name, session_num):
-    dir_name = first_name + '_' + last_name + '_' + 'Session' + str(session_num)
+def create_user_directory(first_name, last_name):
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    new_dir_path = os.path.join(script_dir, dir_name)
-    os.mkdir(new_dir_path)
-    return dir_name
+    
+    # Create CollectedData folder if it doesn't exist (only happens first time)
+    collected_data_dir = os.path.join(script_dir, "CollectedData")
+    os.makedirs(collected_data_dir, exist_ok=True)
+    
+    # Create user folder if it doesn't exist (only happens first time for this user)
+    user_folder_name = first_name + '_' + last_name
+    user_folder_path = os.path.join(collected_data_dir, user_folder_name)
+    os.makedirs(user_folder_path, exist_ok=True)
+    
+    # Find the highest existing session number
+    existing_sessions = []
+    if os.path.exists(user_folder_path):
+        for folder in os.listdir(user_folder_path):
+            if folder.startswith('Session') and os.path.isdir(os.path.join(user_folder_path, folder)):
+                try:
+                    session_num = int(folder.replace('Session', ''))
+                    existing_sessions.append(session_num)
+                except ValueError:
+                    continue
+    
+    # Determine next session number
+    next_session = max(existing_sessions) + 1 if existing_sessions else 1
+    
+    # Create new session folder
+    session_folder_name = 'Session' + str(next_session)
+    session_folder_path = os.path.join(user_folder_path, session_folder_name)
+    os.makedirs(session_folder_path, exist_ok=True)
+    
+    # Return both the path and the session number
+    return os.path.join("CollectedData", user_folder_name, session_folder_name), next_session
 
 class EEGProcessor:
     def __init__(self):
@@ -169,14 +196,7 @@ def save_data(eeg_processor, metadata, direction, trial_num, directory):
         pickle.dump((sig, metadata), f)
     
 
-def main():
-    #session_num = input("Enter the session number: ")
-    
-    if len(sys.argv) > 1:
-        session_num = sys.argv[1]  # whatever you type after the script name
-    else:
-        session_num = input("Enter the session number: ")
-
+def main():    
     eeg_processor = EEGProcessor()
 
 
@@ -557,7 +577,7 @@ def main():
                         exercise_yn = box.get_caption()
 
                 #Use questionnaire data to update metadata and create session directory
-                directory = create_user_directory(first_name, last_name, session_num)
+                directory, session_num = create_user_directory(first_name, last_name)
                 metadata = {"First Name"            : first_name,
                             "Last Name"             : last_name,
                             "EID"                   : eid,
