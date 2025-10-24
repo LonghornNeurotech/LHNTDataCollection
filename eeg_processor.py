@@ -6,6 +6,14 @@ import serial
 import serial.tools.list_ports
 import torch
 
+from data_validation import (
+    detect_nan_inf,
+    detect_flatline,
+    detect_extreme_noise,
+    detect_channel_duplication,
+    ValidationPackage
+)
+
 def find_serial_port():
     """
     Automatically find the correct serial port for the device across different operating systems.
@@ -15,18 +23,21 @@ def find_serial_port():
     """
     system = platform.system()
     ports = list(serial.tools.list_ports.comports())
+    print(f"Available ports: {[p.device for p in ports]}")
     
     for port in ports:
-        if system == "Darwin":  # macOS
-            if any(identifier in port.device.lower() for identifier in ["usbserial", "cu.usbmodem", "tty.usbserial"]):
-                return port.device
-        elif system == "Windows":
-            if "com" in port.device.lower():
-                return port.device
-        elif system == "Linux":
-            if "ttyUSB" in port.device or "ttyACM" in port.device:
-                return port.device
-    
+        if 'CH340' in port.description or 'USB' in port.description:
+            print(f"Found potential EEG device: {port.device}")
+            if system == "Darwin":  # macOS
+                if any(identifier in port.device.lower() for identifier in ["usbserial", "cu.usbmodem", "tty.usbserial"]):
+                    return port.device
+            elif system == "Windows":
+                if "com" in port.device.lower():
+                    return port.device
+            elif system == "Linux":
+                if "ttyUSB" in port.device or "ttyACM" in port.device:
+                    return port.device
+    print("WARNING: No EEG device detected. Using synthetic board.")
     return None
 
 
@@ -95,11 +106,16 @@ class EEGProcessor:
 
         # UNCOMMENT THE FOLLOWING 3 LINES FOR REAL BOARD
         serial_port = find_serial_port()
-        params.serial_port = serial_port
-        self.board_id = BoardIds.CYTON_BOARD.value
+        if serial_port is None:
+            print("No hardware found - using synthetic board for testing")
+            self.board_id = BoardIds.SYNTHETIC_BOARD.value
+            params = BrainFlowInputParams()
+        else:
+            params.serial_port = serial_port
+            self.board_id = BoardIds.CYTON_BOARD.value
 
         # COMMENT OUT THE FOLLOWING LINE FOR REAL BOARD
-        # self.board_id = BoardIds.SYNTHETIC_BOARD.value
+        #self.board_id = BoardIds.SYNTHETIC_BOARD.value
 
         self.board = BoardShim(self.board_id, params)
         self.board.prepare_session()
@@ -145,6 +161,12 @@ class EEGProcessor:
         
             # Append new raw data to the raw_data_buffer
             eeg_data = data[self.eeg_channels, :]
+
+            is_valid, nan_channels = detect_nan_inf(eeg_data)
+            if not is_valid:
+                print(f"Warning: NaN/Inf detected in channels {nan_channels}")
+                return self.processed_data_buffer[:, -int(duration * self.sampling_rate):]
+            
             self.raw_data_buffer = np.hstack((self.raw_data_buffer, eeg_data))
 
             # Process new data
@@ -194,4 +216,12 @@ class EEGProcessor:
         # change dtype to float32
         model_input = model_input.float()
 
+        flatline_ch = detect_flatline(recent_data)
+        if len(flatline_ch) > 0:
+            print(f"Warning: Flatline detected in channels {flatline_ch}")
+        
+        has_spikes, spike_ch, spike_pct = detect_extreme_noise(recent_data)
+        if has_spikes and spike_pct > 5.0:
+            print(f"Warning: Excessive noise (averaging {spike_pct:.1f}%) in channels {spike_ch}")
+        
         return model_input
