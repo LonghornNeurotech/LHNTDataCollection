@@ -24,6 +24,7 @@ import os
 import time
 import numpy as np
 import pandas as pd
+import pickle
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -35,7 +36,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox,
     QProgressBar, QTextEdit, QTableWidget, QTableWidgetItem,
     QMenuBar, QStatusBar, QToolBar, QAction, QMessageBox,
-    QFileDialog, QSlider, QFrame, QSizePolicy
+    QFileDialog, QSlider, QFrame, QSizePolicy, QRadioButton, QButtonGroup
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QThread, pyqtSignal, QObject, QMutex, QWaitCondition
@@ -50,6 +51,97 @@ import pyqtgraph.exporters
 
 # Import the existing EEG processor
 from eeg_processor import EEGProcessor, find_serial_port
+
+
+class StoredDataManager:
+    """
+    Manager for loading and serving stored EEG data from .pkl files.
+    Expects pickle file with data sampled at 125 Hz in 1-second segments.
+    """
+    
+    def __init__(self, pkl_file_path: str = None):
+        self.pkl_file_path = pkl_file_path
+        self.samples = []  # List of 1-second samples
+        self.num_channels = 0
+        self.sampling_rate = 125
+        self.current_sample_idx = 0
+        
+        if pkl_file_path and os.path.exists(pkl_file_path):
+            self.load_data(pkl_file_path)
+    
+    def load_data(self, pkl_file_path: str):
+        """
+        Load EEG data from pickle file.
+        Expected format: List of numpy arrays with shape (channels, 125)
+        or a single array with shape (num_samples, channels, 125)
+        """
+        try:
+            with open(pkl_file_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            # Handle different data formats
+            if isinstance(data, list):
+                self.samples = data
+            elif isinstance(data, np.ndarray):
+                if data.ndim == 3:  # (num_samples, channels, time_points)
+                    self.samples = [data[i] for i in range(data.shape[0])]
+                elif data.ndim == 2:  # (channels, time_points) - split into 1-sec chunks
+                    num_samples = data.shape[1] // self.sampling_rate
+                    self.samples = [
+                        data[:, i*self.sampling_rate:(i+1)*self.sampling_rate]
+                        for i in range(num_samples)
+                    ]
+            elif isinstance(data, dict):
+                # Handle dictionary format with 'samples' or 'data' key
+                if 'samples' in data:
+                    self.samples = data['samples']
+                elif 'data' in data:
+                    raw_data = data['data']
+                    if isinstance(raw_data, np.ndarray) and raw_data.ndim == 2:
+                        num_samples = raw_data.shape[1] // self.sampling_rate
+                        self.samples = [
+                            raw_data[:, i*self.sampling_rate:(i+1)*self.sampling_rate]
+                            for i in range(num_samples)
+                        ]
+            
+            if self.samples:
+                # Get number of channels from first sample
+                first_sample = self.samples[0]
+                if first_sample.ndim == 2:
+                    self.num_channels = first_sample.shape[0]
+                elif first_sample.ndim == 1:
+                    self.num_channels = 1
+                    self.samples = [s.reshape(1, -1) for s in self.samples]
+                
+                print(f"Loaded {len(self.samples)} samples with {self.num_channels} channels")
+            else:
+                raise ValueError("No valid samples found in pickle file")
+                
+        except Exception as e:
+            print(f"Error loading pickle file: {e}")
+            raise
+    
+    def get_sample(self, index: int) -> np.ndarray:
+        """
+        Get a specific 1-second sample by index.
+        Returns array with shape (1, channels, 125) for consistency with live data.
+        """
+        if not self.samples:
+            return np.zeros((1, self.num_channels or 8, self.sampling_rate))
+        
+        index = max(0, min(index, len(self.samples) - 1))
+        sample = self.samples[index]
+        
+        # Ensure shape is (1, channels, time_points)
+        if sample.ndim == 2:
+            sample = sample[np.newaxis, :, :]
+        
+        return sample
+    
+    def get_num_samples(self) -> int:
+        """Return the number of available samples."""
+        return len(self.samples)
+
 
 class EEGDataWorker(QObject):
     """
@@ -251,19 +343,57 @@ class ControlPanel(QGroupBox):
     start_recording = pyqtSignal(str)  # filename
     stop_recording = pyqtSignal()
     settings_changed = pyqtSignal(dict)  # settings dictionary
+    mode_changed = pyqtSignal(str)  # 'live' or 'stored'
+    sample_selected = pyqtSignal(int)  # sample index
+    load_pkl_file = pyqtSignal(str)  # pkl file path
     
     def __init__(self):
         super().__init__("Control Panel")
         self.recording = False
         self.connected = False
+        self.current_mode = 'live'
         self.setup_ui()
     
     def setup_ui(self):
         """Set up the control panel UI."""
         layout = QVBoxLayout()
         
-        # Connection controls
-        conn_group = QGroupBox("Connection")
+        # ============= MODE SELECTION =============
+        mode_group = QGroupBox("Data Source Mode")
+        mode_layout = QVBoxLayout()
+        
+        # Radio buttons for mode selection
+        self.mode_button_group = QButtonGroup()
+        self.live_radio = QRadioButton("Live EEG Device")
+        self.stored_radio = QRadioButton("Stored Data (.pkl)")
+        
+        self.mode_button_group.addButton(self.live_radio)
+        self.mode_button_group.addButton(self.stored_radio)
+        self.live_radio.setChecked(True)
+        
+        self.live_radio.toggled.connect(self.on_mode_changed)
+        
+        mode_layout.addWidget(self.live_radio)
+        mode_layout.addWidget(self.stored_radio)
+        
+        # Load pickle file button
+        load_pkl_layout = QHBoxLayout()
+        self.load_pkl_btn = QPushButton("Load .pkl File")
+        self.load_pkl_btn.clicked.connect(self.on_load_pkl_clicked)
+        self.load_pkl_btn.setEnabled(False)
+        load_pkl_layout.addWidget(self.load_pkl_btn)
+        mode_layout.addLayout(load_pkl_layout)
+        
+        self.pkl_file_label = QLabel("No file loaded")
+        self.pkl_file_label.setWordWrap(True)
+        self.pkl_file_label.setStyleSheet("font-size: 9px; color: gray;")
+        mode_layout.addWidget(self.pkl_file_label)
+        
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
+        
+        # Connection controls (only for live mode)
+        self.conn_group = QGroupBox("Connection")
         conn_layout = QVBoxLayout()
         
         # Port selection
@@ -299,8 +429,8 @@ class ControlPanel(QGroupBox):
         board_layout.addWidget(self.board_combo)
         conn_layout.addLayout(board_layout)
         
-        conn_group.setLayout(conn_layout)
-        layout.addWidget(conn_group)
+        self.conn_group.setLayout(conn_layout)
+        layout.addWidget(self.conn_group)
         
         # Recording controls
         rec_group = QGroupBox("Recording")
@@ -368,10 +498,93 @@ class ControlPanel(QGroupBox):
         proc_group.setLayout(proc_layout)
         layout.addWidget(proc_group)
         
+        # ============= SAMPLE SELECTOR (for stored mode) =============
+        self.sample_group = QGroupBox("Sample Selection")
+        sample_layout = QVBoxLayout()
+        
+        # Sample info label
+        self.sample_info_label = QLabel("No samples loaded")
+        sample_layout.addWidget(self.sample_info_label)
+        
+        # Sample selector slider
+        slider_layout = QVBoxLayout()
+        self.sample_slider = QSlider(Qt.Horizontal)
+        self.sample_slider.setMinimum(0)
+        self.sample_slider.setMaximum(13)  # Default to 14 samples (0-13)
+        self.sample_slider.setValue(0)
+        self.sample_slider.setTickPosition(QSlider.TicksBelow)
+        self.sample_slider.setTickInterval(1)
+        self.sample_slider.valueChanged.connect(self.on_sample_changed)
+        slider_layout.addWidget(QLabel("Sample:"))
+        slider_layout.addWidget(self.sample_slider)
+        
+        # Current sample label
+        self.current_sample_label = QLabel("Sample 1 of 14")
+        self.current_sample_label.setAlignment(Qt.AlignCenter)
+        slider_layout.addWidget(self.current_sample_label)
+        
+        sample_layout.addLayout(slider_layout)
+        
+        self.sample_group.setLayout(sample_layout)
+        self.sample_group.setEnabled(False)  # Disabled until pkl file is loaded
+        layout.addWidget(self.sample_group)
+        
         # Add stretch to push controls to top
         layout.addStretch()
         
         self.setLayout(layout)
+    
+    def on_mode_changed(self, checked):
+        """Handle mode change between live and stored."""
+        if checked:  # Live radio button was toggled on
+            self.current_mode = 'live'
+            self.conn_group.setEnabled(True)
+            self.load_pkl_btn.setEnabled(False)
+            self.sample_group.setEnabled(False)
+            self.mode_changed.emit('live')
+        else:  # Stored radio button
+            self.current_mode = 'stored'
+            self.conn_group.setEnabled(False)
+            self.load_pkl_btn.setEnabled(True)
+            # Sample group will be enabled after file is loaded
+            self.mode_changed.emit('stored')
+    
+    def on_load_pkl_clicked(self):
+        """Handle load pickle file button click."""
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Pickle File",
+            "",
+            "Pickle Files (*.pkl);;All Files (*)"
+        )
+        
+        if filename:
+            self.load_pkl_file.emit(filename)
+    
+    def set_pkl_file_loaded(self, filename: str, num_samples: int):
+        """Update UI after pickle file is loaded."""
+        self.pkl_file_label.setText(f"Loaded: {os.path.basename(filename)}")
+        self.sample_info_label.setText(f"{num_samples} samples available")
+        
+        # Update slider range
+        self.sample_slider.setMaximum(max(0, num_samples - 1))
+        self.sample_slider.setValue(0)
+        
+        # Enable sample selector
+        self.sample_group.setEnabled(True)
+        
+        self.update_sample_label()
+    
+    def on_sample_changed(self, value):
+        """Handle sample slider change."""
+        self.update_sample_label()
+        self.sample_selected.emit(value)
+    
+    def update_sample_label(self):
+        """Update the current sample label."""
+        current = self.sample_slider.value() + 1
+        total = self.sample_slider.maximum() + 1
+        self.current_sample_label.setText(f"Sample {current} of {total}")
     
     def refresh_ports(self):
         """Refresh the list of available serial ports."""
@@ -446,6 +659,7 @@ class ControlPanel(QGroupBox):
 class OpenBCIMainWindow(QMainWindow):
     """
     Main application window for the OpenBCI EEG data collection interface.
+    Supports both live EEG device and stored .pkl file data sources.
     """
     
     def __init__(self):
@@ -457,6 +671,10 @@ class OpenBCIMainWindow(QMainWindow):
         self.recording = False
         self.recording_data = []
         self.recording_filename = ""
+        
+        # Stored data mode
+        self.current_mode = 'live'  # 'live' or 'stored'
+        self.stored_data_manager: Optional[StoredDataManager] = None
         
         # Setup UI
         self.setup_ui()
@@ -487,6 +705,9 @@ class OpenBCIMainWindow(QMainWindow):
         self.control_panel.disconnect_requested.connect(self.disconnect_from_board)
         self.control_panel.start_recording.connect(self.start_recording)
         self.control_panel.stop_recording.connect(self.stop_recording)
+        self.control_panel.mode_changed.connect(self.on_mode_changed)
+        self.control_panel.sample_selected.connect(self.on_sample_selected)
+        self.control_panel.load_pkl_file.connect(self.load_pkl_file)
         
         left_panel.addWidget(self.control_panel)
         
@@ -750,6 +971,66 @@ class OpenBCIMainWindow(QMainWindow):
         """Update the status bar message."""
         self.status_bar.showMessage(message)
     
+    def on_mode_changed(self, mode: str):
+        """Handle mode change between live and stored data."""
+        self.current_mode = mode
+        
+        if mode == 'live':
+            self.log_message("Switched to Live EEG Device mode")
+            # Clear stored data if any
+            self.stored_data_manager = None
+        else:  # stored mode
+            self.log_message("Switched to Stored Data mode")
+            # Disconnect from live board if connected
+            if self.eeg_worker is not None:
+                self.disconnect_from_board()
+    
+    def load_pkl_file(self, filename: str):
+        """Load a pickle file containing stored EEG data."""
+        try:
+            self.log_message(f"Loading pickle file: {filename}")
+            
+            # Create stored data manager
+            self.stored_data_manager = StoredDataManager(filename)
+            
+            num_samples = self.stored_data_manager.get_num_samples()
+            num_channels = self.stored_data_manager.num_channels
+            
+            self.log_message(f"Loaded {num_samples} samples with {num_channels} channels")
+            
+            # Update control panel
+            self.control_panel.set_pkl_file_loaded(filename, num_samples)
+            
+            # Update plot widget if needed
+            if num_channels != self.plot_widget.num_channels:
+                # Recreate plot widget with correct number of channels
+                # For now, just log a message
+                self.log_message(f"Note: Plot configured for {self.plot_widget.num_channels} channels, data has {num_channels}")
+            
+            # Display first sample
+            self.on_sample_selected(0)
+            
+        except Exception as e:
+            self.log_message(f"Error loading pickle file: {e}")
+            QMessageBox.critical(self, "Load Error", f"Failed to load pickle file:\n{str(e)}")
+    
+    def on_sample_selected(self, sample_index: int):
+        """Handle sample selection in stored data mode."""
+        if self.current_mode != 'stored' or self.stored_data_manager is None:
+            return
+        
+        try:
+            # Get the selected sample
+            sample_data = self.stored_data_manager.get_sample(sample_index)
+            
+            # Update the plot
+            self.plot_widget.update_data(sample_data)
+            
+            self.log_message(f"Displaying sample {sample_index + 1}")
+            
+        except Exception as e:
+            self.log_message(f"Error displaying sample: {e}")
+    
     def export_data(self):
         """Export current buffer data to file."""
         try:
@@ -786,9 +1067,12 @@ class OpenBCIMainWindow(QMainWindow):
             "About OpenBCI EEG Demo",
             "OpenBCI EEG Data Collection Demo\n\n"
             "A PyQt-based application for real-time EEG data\n"
-            "collection and visualization using OpenBCI hardware.\n\n"
+            "collection and visualization using OpenBCI hardware\n"
+            "or stored .pkl data files.\n\n"
             "Features:\n"
             "• Real-time multi-channel EEG visualization\n"
+            "• Stored data playback from .pkl files\n"
+            "• Sample-by-sample navigation (125 Hz, 1-sec)\n"
             "• Data recording and export\n"
             "• Signal processing controls\n"
             "• Connection management\n\n"
