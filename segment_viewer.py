@@ -499,7 +499,7 @@ class SegmentViewer(QMainWindow):
             self.spinbox.setValue(new_window)
             self.info_label.setText(f"Window {new_window} / {self.num_windows-1}")
             self.slider.blockSignals(False)
-            self.slider.blockSignals(False)
+            self.spinbox.blockSignals(False)
     
     def get_window_bounds(self, window_idx):
         """Get start and end sample indices for a given window"""
