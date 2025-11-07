@@ -154,10 +154,18 @@ class SegmentViewer(QMainWindow):
         
         self.main_layout.addLayout(file_layout)
         
+        # Channel checkboxes (initially disabled but visible)
+        self.channel_group = QGroupBox("Channels")
+        channel_layout = QHBoxLayout()
+        self.channel_checkboxes = []
+        self.channel_group.setLayout(channel_layout)
+        self.channel_group.setEnabled(False)  # Disabled until file loaded
+        self.main_layout.addWidget(self.channel_group)
+        
         # Plot container (will be replaced when switching modes)
         self.plot_container = QWidget()
         self.plot_layout = QVBoxLayout(self.plot_container)
-        self.main_layout.addWidget(self.plot_container)
+        self.main_layout.addWidget(self.plot_container, stretch=1)  # Give plot area most of the space
         
         # Create initial "no file" message
         self.no_file_label = QLabel("No file loaded\n\nClick 'Load File' to begin")
@@ -165,15 +173,7 @@ class SegmentViewer(QMainWindow):
         self.no_file_label.setStyleSheet("font-size: 24px; color: gray;")
         self.plot_layout.addWidget(self.no_file_label)
         
-        # Channel checkboxes (initially hidden)
-        self.channel_group = QGroupBox("Channels")
-        channel_layout = QHBoxLayout()
-        self.channel_checkboxes = []
-        self.channel_group.setLayout(channel_layout)
-        self.channel_group.setVisible(False)
-        self.main_layout.addWidget(self.channel_group)
-        
-        # Window navigation (initially hidden)
+        # Window navigation (initially disabled but visible)
         self.nav_widget = QWidget()
         nav_layout = QHBoxLayout(self.nav_widget)
         
@@ -195,34 +195,34 @@ class SegmentViewer(QMainWindow):
         nav_layout.addWidget(self.spinbox)
         
         # Previous/Next buttons
-        prev_btn = QPushButton("◄ Prev")
-        prev_btn.clicked.connect(self.prev_window)
-        nav_layout.addWidget(prev_btn)
+        self.prev_btn = QPushButton("◄ Prev")
+        self.prev_btn.clicked.connect(self.prev_window)
+        nav_layout.addWidget(self.prev_btn)
         
-        next_btn = QPushButton("Next ►")
-        next_btn.clicked.connect(self.next_window)
-        nav_layout.addWidget(next_btn)
+        self.next_btn = QPushButton("Next ►")
+        self.next_btn.clicked.connect(self.next_window)
+        nav_layout.addWidget(self.next_btn)
         
         # Window info label
         self.info_label = QLabel("No file loaded")
         nav_layout.addWidget(self.info_label)
         
         # Sampling settings button
-        sampling_btn = QPushButton("⚙ Sampling Settings")
-        sampling_btn.clicked.connect(self.open_sampling_dialog)
-        nav_layout.addWidget(sampling_btn)
+        self.sampling_btn = QPushButton("⚙ Sampling Settings")
+        self.sampling_btn.clicked.connect(self.open_sampling_dialog)
+        nav_layout.addWidget(self.sampling_btn)
         
         # Auto-fit button
-        autofit_btn = QPushButton("📈 Auto-Fit")
-        autofit_btn.clicked.connect(self.auto_fit_plot)
-        nav_layout.addWidget(autofit_btn)
+        self.autofit_btn = QPushButton("📈 Auto-Fit")
+        self.autofit_btn.clicked.connect(self.auto_fit_plot)
+        nav_layout.addWidget(self.autofit_btn)
         
         # Window settings button
-        window_settings_btn = QPushButton("👁️ Window Settings")
-        window_settings_btn.clicked.connect(self.open_window_settings_dialog)
-        nav_layout.addWidget(window_settings_btn)
+        self.window_settings_btn = QPushButton("👁️ Window Settings")
+        self.window_settings_btn.clicked.connect(self.open_window_settings_dialog)
+        nav_layout.addWidget(self.window_settings_btn)
         
-        self.nav_widget.setVisible(False)
+        self.nav_widget.setEnabled(False)  # Disabled until file loaded
         self.main_layout.addWidget(self.nav_widget)
     
     def load_file(self):
@@ -290,8 +290,8 @@ class SegmentViewer(QMainWindow):
                 channel_layout.addWidget(cb)
                 self.channel_checkboxes.append(cb)
             
-            # Show channel group
-            self.channel_group.setVisible(True)
+            # Enable channel group
+            self.channel_group.setEnabled(True)
             
             # Update navigation controls
             self.slider.setMaximum(self.num_windows - 1)
@@ -300,8 +300,8 @@ class SegmentViewer(QMainWindow):
             self.spinbox.setValue(0)
             self.info_label.setText(f"Window 0 / {self.num_windows-1}")
             
-            # Show navigation
-            self.nav_widget.setVisible(True)
+            # Enable navigation
+            self.nav_widget.setEnabled(True)
             
             # Initialize with first channel selected
             self.channel_checkboxes[0].setChecked(True)
@@ -573,9 +573,6 @@ class SegmentViewer(QMainWindow):
     
     def open_window_settings_dialog(self):
         """Open dialog to configure window display settings"""
-        if not self.file_loaded:
-            QMessageBox.warning(self, "No File", "Please load a file first.")
-            return
         dialog = WindowSettingsDialog(self.display_mode, self)
         if dialog.exec_() == QDialog.Accepted:
             new_mode = dialog.get_mode()
@@ -594,9 +591,6 @@ class SegmentViewer(QMainWindow):
     
     def open_sampling_dialog(self):
         """Open dialog to configure sampling parameters"""
-        if not self.file_loaded:
-            QMessageBox.warning(self, "No File", "Please load a file first.")
-            return
         dialog = SamplingDialog(self.window_size_sec, self.sampling_rate, self)
         if dialog.exec_() == QDialog.Accepted:
             new_window_size, new_sampling_rate = dialog.get_values()
