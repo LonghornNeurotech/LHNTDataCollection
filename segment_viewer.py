@@ -17,7 +17,6 @@ from PyQt5.QtCore import Qt
 
 # Import your data loading functions
 from conversions import get_gdf_array, get_pkl_array
-from eeg_processor import sliding_window_segmentation
 
 class WindowSettingsDialog(QDialog):
     """Dialog for configuring window display settings"""
@@ -253,9 +252,8 @@ class SegmentViewer(QMainWindow):
             self.file_label.setStyleSheet("color: green; font-weight: bold;")
             self.file_loaded = True
             
-            # Generate segmentation
-            self.segmented = self.create_segmentation()
-            self.num_windows, self.num_channels, self.num_samples = self.segmented.shape
+            # Prepare data and calculate window parameters
+            self.prepare_data()
             self.current_window = 0
             
             # Update window title
@@ -323,8 +321,18 @@ class SegmentViewer(QMainWindow):
         self.plot_widget.setLabel('bottom', 'Time (seconds)')
         self.plot_widget.setLabel('left', 'Amplitude')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        
+        # Enable auto-downsampling for performance
+        self.plot_widget.setDownsampling(auto=True, mode='peak')
+        
+        # Connect range change signal for dynamic updates
+        self.plot_widget.sigRangeChanged.connect(self.on_overlay_range_changed)
+        
         self.plot_layout.addWidget(self.plot_widget)
         self.plot_widgets = [self.plot_widget]  # Store in list for consistency
+        
+        # Dictionary to store plot items for each channel
+        self.overlay_plot_items = {}
     
     def setup_stacked_mode(self):
         """Setup multiple plot widgets for stacked display"""
@@ -336,34 +344,56 @@ class SegmentViewer(QMainWindow):
         
         # Create separate plot widget for each channel
         self.plot_widgets = []
+        self.stacked_plot_items = {}  # Dictionary to store plot items for each channel
+        
         for i in range(self.num_channels):
             plot = pg.PlotWidget()
             plot.setLabel('left', f'Ch{i+1}')
             if i == self.num_channels - 1:
                 plot.setLabel('bottom', 'Time (seconds)')
             plot.showGrid(x=True, y=True, alpha=0.3)
+            
+            # Enable auto-downsampling for performance
+            plot.setDownsampling(auto=True, mode='peak')
+            
+            # Connect range change signal for dynamic updates
+            plot.sigRangeChanged.connect(lambda _, ch=i: self.on_stacked_range_changed(ch))
+            
             # Don't add to layout yet - will be added dynamically in update_plot_stacked
             self.plot_widgets.append(plot)
     
-    def create_segmentation(self):
-        """Create segmentation from raw data with current parameters"""
-        window_size = int(self.window_size_sec * self.sampling_rate)
-        self.stride = int(window_size * 0.8)  # 20% overlap - store for time calculation
-        segmented = sliding_window_segmentation(self.raw_data, window_size=window_size, stride=self.stride)
+    def prepare_data(self):
+        """Prepare data and calculate window parameters"""
+        # Calculate window parameters
+        self.window_size_samples = int(self.window_size_sec * self.sampling_rate)
+        self.stride = int(self.window_size_samples * 0.8)  # 20% overlap
+        
+        # Calculate number of windows
+        total_samples = self.raw_data.shape[1]
+        self.num_windows = (total_samples - self.window_size_samples) // self.stride + 1
+        self.num_channels = self.raw_data.shape[0]
+        self.num_samples_per_window = self.window_size_samples
+        
+        # Create full time axis for entire dataset
+        self.full_time_axis = np.arange(total_samples) / self.sampling_rate
         
         # Pre-calculate IQR bounds for entire dataset (per channel)
         self.channel_iqr_bounds = {}
-        for ch_idx in range(segmented.shape[1]):  # num_channels
-            # Get all data for this channel across all windows
-            channel_data = segmented[:, ch_idx, :].flatten()
+        for ch_idx in range(self.num_channels):
+            # Get all data for this channel
+            channel_data = self.raw_data[ch_idx, :]
             q1 = np.quantile(channel_data, 0.25)
             q3 = np.quantile(channel_data, 0.75)
             iqr = q3 - q1
             y_min = q1 - iqr * 5.0
             y_max = q3 + iqr * 5.0
             self.channel_iqr_bounds[ch_idx] = (y_min, y_max)
-        
-        return segmented
+    
+    def get_window_bounds(self, window_idx):
+        """Get start and end sample indices for a given window"""
+        start_sample = window_idx * self.stride
+        end_sample = start_sample + self.window_size_samples
+        return start_sample, end_sample
     
     def get_iqr_bounds_for_channels(self, channel_indices):
         """Get the maximum IQR bounds across specified channels"""
@@ -381,14 +411,6 @@ class SegmentViewer(QMainWindow):
                 best_bounds = (y_min, y_max)
         
         return best_bounds
-    
-    def get_time_axis(self):
-        """Calculate time axis in seconds for current window"""
-        # Absolute start sample for current window
-        absolute_start_sample = self.current_window * self.stride
-        # Time in seconds for each sample in the window
-        time_axis = (absolute_start_sample + np.arange(self.num_samples)) / self.sampling_rate
-        return time_axis
     
     def toggle_channel(self, channel_idx, state):
         """Toggle channel visibility"""
@@ -409,55 +431,105 @@ class SegmentViewer(QMainWindow):
         else:
             self.update_plot_stacked()
     
+    def get_visible_data_range(self, view_range):
+        """Get the sample indices for the visible time range, with some padding"""
+        t_min, t_max = view_range
+        # Add padding (show 20% extra on each side for smooth scrolling)
+        padding = (t_max - t_min) * 0.2
+        t_min_padded = max(0, t_min - padding)
+        t_max_padded = min(self.full_time_axis[-1], t_max + padding)
+        
+        # Convert time to sample indices
+        start_idx = max(0, int(t_min_padded * self.sampling_rate))
+        end_idx = min(len(self.full_time_axis), int(t_max_padded * self.sampling_rate))
+        
+        return start_idx, end_idx
+    
     def update_plot_overlay(self, set_y_range=True):
-        """Update plot in overlay mode
+        """Update plot in overlay mode - plots only visible data
         
         Args:
             set_y_range: If True, update Y-axis bounds. Set to False when just changing windows.
         """
+        # Clear existing plot items
+        self.overlay_plot_items.clear()
         self.plot_widget.clear()
         
         if not self.active_channels:
             return
         
-        # Get time axis for current window
-        time_axis = self.get_time_axis()
+        # Get current window bounds
+        start_sample, end_sample = self.get_window_bounds(self.current_window)
+        t_start = self.full_time_axis[start_sample]
+        t_end = self.full_time_axis[min(end_sample - 1, len(self.full_time_axis) - 1)]
+        
+        # Get visible data range with padding
+        view_range = [t_start, t_end]
+        start_idx, end_idx = self.get_visible_data_range(view_range)
         
         # Color palette for different channels
         colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
         
-        # Plot each active channel
+        # Plot only visible data for each active channel
         for ch_idx in sorted(self.active_channels):
-            data = self.segmented[self.current_window, ch_idx, :]
+            data = self.raw_data[ch_idx, start_idx:end_idx]
+            time_slice = self.full_time_axis[start_idx:end_idx]
             color = colors[ch_idx % len(colors)]
-            self.plot_widget.plot(
-                time_axis,
+            
+            plot_item = self.plot_widget.plot(
+                time_slice,
                 data,
                 pen=pg.mkPen(color=color, width=2),
                 name=f'Ch{ch_idx+1}'
             )
+            self.overlay_plot_items[ch_idx] = plot_item
         
         # Only set Y range when channels change, not on every window update
         if set_y_range:
             y_min, y_max = self.get_iqr_bounds_for_channels(self.active_channels)
             self.plot_widget.setYRange(y_min, y_max, padding=0)
         
-        # Set X-axis range in seconds
-        self.plot_widget.setXRange(time_axis[0], time_axis[-1], padding=0)
+        # Set X-axis range to show current window
+        self.plot_widget.setXRange(t_start, t_end, padding=0)
         
         self.plot_widget.addLegend()
     
+    def on_overlay_range_changed(self):
+        """Called when user zooms or pans in overlay mode - updates visible data"""
+        if not self.file_loaded or not self.active_channels:
+            return
+        
+        # Get current view range
+        view_range = self.plot_widget.viewRange()[0]  # [x_min, x_max]
+        start_idx, end_idx = self.get_visible_data_range(view_range)
+        
+        # Color palette
+        colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
+        
+        # Update data for each active channel
+        for ch_idx in sorted(self.active_channels):
+            if ch_idx in self.overlay_plot_items:
+                data = self.raw_data[ch_idx, start_idx:end_idx]
+                time_slice = self.full_time_axis[start_idx:end_idx]
+                self.overlay_plot_items[ch_idx].setData(time_slice, data)
+    
     def update_plot_stacked(self, rebuild_layout=True):
-        """Update plots in stacked mode - dynamically rebuilds layout with only active channels
+        """Update plots in stacked mode - plots only visible data
         
         Args:
             rebuild_layout: If True, rebuild layout (when channels change). 
-                          If False, just update data (when navigating windows).
+                          If False, just update X-axis bounds (when navigating windows).
         """
         colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
         
-        # Get time axis for current window
-        time_axis = self.get_time_axis()
+        # Get window time bounds
+        start_sample, end_sample = self.get_window_bounds(self.current_window)
+        t_start = self.full_time_axis[start_sample]
+        t_end = self.full_time_axis[min(end_sample - 1, len(self.full_time_axis) - 1)]
+        
+        # Get visible data range with padding
+        view_range = [t_start, t_end]
+        start_idx, end_idx = self.get_visible_data_range(view_range)
         
         # Check if we need to rebuild layout (channels changed)
         if rebuild_layout or self.active_channels != self.last_stacked_channels:
@@ -467,6 +539,9 @@ class SegmentViewer(QMainWindow):
                 if child.widget():
                     # Remove from layout but don't delete the widget
                     child.widget().setParent(None)
+            
+            # Clear stacked plot items
+            self.stacked_plot_items.clear()
             
             # Get the IQR bounds from channel with greatest range
             y_min, y_max = self.get_iqr_bounds_for_channels(self.active_channels)
@@ -483,15 +558,20 @@ class SegmentViewer(QMainWindow):
                 else:
                     plot.setLabel('bottom', '')
                 
-                data = self.segmented[self.current_window, i, :]
+                # Plot only visible data for this channel
+                data = self.raw_data[i, start_idx:end_idx]
+                time_slice = self.full_time_axis[start_idx:end_idx]
                 color = colors[i % len(colors)]
-                plot.plot(time_axis, data, pen=pg.mkPen(color=color, width=2))
+                plot_item = plot.plot(time_slice, data, pen=pg.mkPen(color=color, width=2))
+                
+                # Store plot item for dynamic updates
+                self.stacked_plot_items[i] = plot_item
                 
                 # Use the same IQR bounds for all channels (from channel with greatest range)
                 plot.setYRange(y_min, y_max, padding=0)
                 
-                # Set X-axis range in seconds
-                plot.setXRange(time_axis[0], time_axis[-1], padding=0)
+                # Set X-axis range to current window
+                plot.setXRange(t_start, t_end, padding=0)
                 
                 # Add to layout with equal stretch
                 self.plot_layout.addWidget(plot, stretch=1)
@@ -500,18 +580,32 @@ class SegmentViewer(QMainWindow):
             # Remember which channels are in the layout
             self.last_stacked_channels = self.active_channels.copy()
         else:
-            # Just update the data in existing plots without rebuilding layout or resetting axes
+            # Update visible data and X-axis bounds
             for i in self.active_channels:
                 plot = self.plot_widgets[i]
-                plot.clear()
+                # Update X-axis range to current window
+                plot.setXRange(t_start, t_end, padding=0)
                 
-                data = self.segmented[self.current_window, i, :]
-                color = colors[i % len(colors)]
-                plot.plot(time_axis, data, pen=pg.mkPen(color=color, width=2))
-                
-                # Update X-axis range (time changes between windows)
-                plot.setXRange(time_axis[0], time_axis[-1], padding=0)
-                # Don't touch Y-axis - it's already set correctly
+                # Update visible data
+                if i in self.stacked_plot_items:
+                    data = self.raw_data[i, start_idx:end_idx]
+                    time_slice = self.full_time_axis[start_idx:end_idx]
+                    self.stacked_plot_items[i].setData(time_slice, data)
+    
+    def on_stacked_range_changed(self, channel_idx):
+        """Called when user zooms or pans in stacked mode - updates visible data for one channel"""
+        if not self.file_loaded or channel_idx not in self.active_channels:
+            return
+        
+        plot = self.plot_widgets[channel_idx]
+        view_range = plot.viewRange()[0]  # [x_min, x_max]
+        start_idx, end_idx = self.get_visible_data_range(view_range)
+        
+        # Update data for this channel
+        if channel_idx in self.stacked_plot_items:
+            data = self.raw_data[channel_idx, start_idx:end_idx]
+            time_slice = self.full_time_axis[start_idx:end_idx]
+            self.stacked_plot_items[channel_idx].setData(time_slice, data)
     
     def on_slider_changed(self, value):
         """Handle slider movement"""
@@ -554,22 +648,24 @@ class SegmentViewer(QMainWindow):
         if not self.file_loaded or not self.active_channels:
             return
         
-        # Get time axis for current window
-        time_axis = self.get_time_axis()
+        # Get window time bounds
+        start_sample, end_sample = self.get_window_bounds(self.current_window)
+        t_start = self.full_time_axis[start_sample]
+        t_end = self.full_time_axis[min(end_sample - 1, len(self.full_time_axis) - 1)]
         
         # Get pre-calculated IQR bounds from channel with greatest range
         y_min, y_max = self.get_iqr_bounds_for_channels(self.active_channels)
         
         if self.display_mode == 'overlay':
-            # Reset to show all time range and IQR bounds
+            # Reset to show current window time range and IQR bounds
             self.plot_widget.setYRange(y_min, y_max, padding=0)
-            self.plot_widget.setXRange(time_axis[0], time_axis[-1], padding=0)
+            self.plot_widget.setXRange(t_start, t_end, padding=0)
         else:
             # Stacked mode: fit each visible plot with same bounds
             for ch_idx in self.active_channels:
                 plot = self.plot_widgets[ch_idx]
                 plot.setYRange(y_min, y_max, padding=0)
-                plot.setXRange(time_axis[0], time_axis[-1], padding=0)
+                plot.setXRange(t_start, t_end, padding=0)
     
     def open_window_settings_dialog(self):
         """Open dialog to configure window display settings"""
@@ -597,10 +693,9 @@ class SegmentViewer(QMainWindow):
             self.window_size_sec = new_window_size
             self.sampling_rate = new_sampling_rate
             
-            # Re-segment data
-            print(f"Re-segmenting with window={new_window_size}s, rate={new_sampling_rate}Hz...")
-            self.segmented = self.create_segmentation()
-            self.num_windows, self.num_channels, self.num_samples = self.segmented.shape
+            # Recalculate window parameters
+            print(f"Recalculating with window={new_window_size}s, rate={new_sampling_rate}Hz...")
+            self.prepare_data()
             
             # Update UI
             self.slider.setMaximum(self.num_windows - 1)
@@ -614,7 +709,7 @@ class SegmentViewer(QMainWindow):
             # Refresh plot (X-axis will be updated automatically)
             self.update_plot()
             
-            print(f"New segmented shape: {self.segmented.shape}")
+            print(f"New window parameters: {self.num_windows} windows, {self.num_samples_per_window} samples per window")
 
 
 def main():
