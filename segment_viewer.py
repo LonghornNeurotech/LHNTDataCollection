@@ -1074,7 +1074,11 @@ class SegmentViewer(QMainWindow):
 
 def main():
     # Initialize app with no file
-    app = QApplication(sys.argv)
+    # Check if QApplication instance already exists
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    
     viewer = SegmentViewer()
     viewer.show()
     sys.exit(app.exec_())
