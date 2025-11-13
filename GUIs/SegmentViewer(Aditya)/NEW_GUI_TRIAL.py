@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Minimal EEG Segment Viewer
 Displays segmented EEG data with channel selection and window navigation
