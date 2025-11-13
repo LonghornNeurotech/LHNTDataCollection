@@ -1,6 +1,9 @@
 import numpy as np
 from scipy.signal import butter, filtfilt, medfilt
 
+# Advanced_filtering tests out using a more advanced form of notch filter called spectrum interpolation
+# In case spectrum interpolation is too computationally expensive for your model, switch back to simple notch filter
+
 def spectrum_interpolation_notch(signal, fs, notch_freq=60.0, notch_width=2):
     """Remove 60Hz using FFT interpolation - ENHANCED"""
     # Algorithm from PDF Section 2
