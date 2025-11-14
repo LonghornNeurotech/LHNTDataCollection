@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QRadioButton, QButtonGroup,
     QFileDialog, QMessageBox
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 
 # Import your data loading functions
 from conversions import get_gdf_array, get_pkl_array
@@ -79,6 +79,13 @@ class SegmentViewer(QMainWindow):
         
         # Track last processed horizontal zoom value to avoid expensive updates
         self.last_horizontal_zoom_value = None
+        
+        # Autoplay state
+        self.autoplay_active = False
+        self.autoplay_speed = 1.0  # 1x = real-time
+        self.autoplay_timer = QTimer()
+        self.autoplay_timer.timeout.connect(self.autoplay_step)
+        self.autoplay_current_time = 0.0  # Current time position in seconds
         
         self.setWindowTitle("Segment Viewer - No File Loaded")
         self.setGeometry(100, 100, 1200, 800)
@@ -149,6 +156,7 @@ class SegmentViewer(QMainWindow):
         self.horizontal_zoom_slider.setTickInterval(50)
         self.horizontal_zoom_slider.valueChanged.connect(self.on_horizontal_zoom_changed)
         self.horizontal_zoom_slider.setEnabled(False)  # Disabled until file loaded
+        self.horizontal_zoom_slider.setMaximumWidth(300)  # Shrink slider width
         horizontal_zoom_layout.addWidget(self.horizontal_zoom_slider)
         
         # Window size spinbox (replaces label)
@@ -175,11 +183,50 @@ class SegmentViewer(QMainWindow):
         self.sampling_rate_spinbox.setEnabled(False)  # Disabled until file loaded
         horizontal_zoom_layout.addWidget(self.sampling_rate_spinbox)
         
+        # Autoplay button
+        self.autoplay_btn = QPushButton("▶ Autoplay")
+        self.autoplay_btn.clicked.connect(self.toggle_autoplay)
+        self.autoplay_btn.setEnabled(False)  # Disabled until file loaded
+        self.autoplay_btn.setMaximumWidth(120)
+        horizontal_zoom_layout.addWidget(self.autoplay_btn)
+        
+        horizontal_zoom_layout.addStretch()  # Push everything to the left
+        
         plot_column_layout.addWidget(horizontal_zoom_widget)
         
         plot_and_zoom_layout.addWidget(plot_column_widget, stretch=1)
         
         self.main_layout.addWidget(plot_and_zoom_widget, stretch=1)
+        
+        # Autoplay playback controls (hidden by default)
+        self.playback_controls_widget = QWidget()
+        playback_controls_layout = QHBoxLayout(self.playback_controls_widget)
+        playback_controls_layout.setContentsMargins(0, 5, 0, 5)
+        
+        playback_controls_layout.addStretch()
+        
+        # Play/Pause button
+        self.play_pause_btn = QPushButton("⏸ Pause")
+        self.play_pause_btn.clicked.connect(self.toggle_play_pause)
+        self.play_pause_btn.setMaximumWidth(100)
+        playback_controls_layout.addWidget(self.play_pause_btn)
+        
+        # Playback speed label and spinbox
+        playback_controls_layout.addWidget(QLabel("  Speed:"))
+        self.playback_speed_spinbox = QDoubleSpinBox()
+        self.playback_speed_spinbox.setRange(0.1, 10.0)
+        self.playback_speed_spinbox.setSingleStep(0.1)
+        self.playback_speed_spinbox.setValue(1.0)
+        self.playback_speed_spinbox.setDecimals(1)
+        self.playback_speed_spinbox.setSuffix("x")
+        self.playback_speed_spinbox.setMaximumWidth(80)
+        self.playback_speed_spinbox.valueChanged.connect(self.on_playback_speed_changed)
+        playback_controls_layout.addWidget(self.playback_speed_spinbox)
+        
+        playback_controls_layout.addStretch()
+        
+        self.playback_controls_widget.setVisible(False)  # Hidden until autoplay is activated
+        self.main_layout.addWidget(self.playback_controls_widget)
         
         # Create initial "no file" message
         self.no_file_label = QLabel("No file loaded\n\nClick 'Load File' to begin")
@@ -309,6 +356,7 @@ class SegmentViewer(QMainWindow):
             self.horizontal_zoom_slider.setEnabled(True)
             self.window_size_spinbox.setEnabled(True)
             self.sampling_rate_spinbox.setEnabled(True)
+            self.autoplay_btn.setEnabled(True)  # Enable autoplay button
             
             # Update navigation controls
             self.slider.setMaximum(self.num_windows - 1)
@@ -638,6 +686,11 @@ class SegmentViewer(QMainWindow):
         if not self.file_loaded:
             return
         
+        # Stop autoplay if active
+        if self.autoplay_active and self.autoplay_timer.isActive():
+            self.autoplay_timer.stop()
+            self.play_pause_btn.setText("▶ Play")
+        
         # Only process if change is significant (> 1 unit = 0.1 seconds)
         # This avoids expensive recalculations on every tiny slider movement
         if self.last_horizontal_zoom_value is not None:
@@ -699,6 +752,11 @@ class SegmentViewer(QMainWindow):
         """Handle window size spinbox changes"""
         if not self.file_loaded:
             return
+        
+        # Stop autoplay if active
+        if self.autoplay_active and self.autoplay_timer.isActive():
+            self.autoplay_timer.stop()
+            self.play_pause_btn.setText("▶ Play")
         
         # Update slider to match
         slider_value = int(value * 10)
@@ -983,6 +1041,11 @@ class SegmentViewer(QMainWindow):
         Args:
             value: Window index to navigate to
         """
+        # Stop autoplay if user manually navigates
+        if self.autoplay_active and self.autoplay_timer.isActive():
+            self.autoplay_timer.stop()
+            self.play_pause_btn.setText("▶ Play")
+        
         self.current_window = value
         
         self.slider.setValue(value)
@@ -1050,6 +1113,118 @@ class SegmentViewer(QMainWindow):
                 # Get individual channel's IQR bounds
                 ch_y_min, ch_y_max = self.channel_iqr_bounds[ch_idx]
                 plot.setYRange(ch_y_min, ch_y_max, padding=0)
+    
+    def toggle_autoplay(self):
+        """Toggle autoplay mode on/off"""
+        if not self.file_loaded:
+            return
+        
+        self.autoplay_active = not self.autoplay_active
+        
+        if self.autoplay_active:
+            # Entering autoplay mode
+            self.autoplay_btn.setText("⏹ Exit Autoplay")
+            self.playback_controls_widget.setVisible(True)
+            
+            # Initialize autoplay position from current view
+            if self.display_mode == 'overlay':
+                view_range = self.plot_widget.viewRange()
+            else:
+                view_range = self.plot_widgets[0].viewRange()
+            
+            self.autoplay_current_time = view_range[0][0]  # Start of current view
+            
+            # Start the timer - update every 16ms (~60 FPS for smooth animation)
+            self.autoplay_timer.start(16)
+        else:
+            # Exiting autoplay mode
+            self.autoplay_btn.setText("▶ Autoplay")
+            self.playback_controls_widget.setVisible(False)
+            self.autoplay_timer.stop()
+    
+    def toggle_play_pause(self):
+        """Toggle play/pause during autoplay"""
+        if not self.autoplay_active:
+            return
+        
+        if self.autoplay_timer.isActive():
+            # Currently playing - pause it
+            self.autoplay_timer.stop()
+            self.play_pause_btn.setText("▶ Play")
+        else:
+            # Currently paused - resume it
+            self.autoplay_timer.start(16)
+            self.play_pause_btn.setText("⏸ Pause")
+    
+    def on_playback_speed_changed(self, value):
+        """Update playback speed"""
+        self.autoplay_speed = value
+    
+    def autoplay_step(self):
+        """Advance autoplay by one frame"""
+        if not self.file_loaded or not self.autoplay_active or not self.active_channels:
+            return
+        
+        # Calculate time increment based on speed (16ms interval, speed multiplier)
+        # Real-time means 0.016 seconds per frame at 1x speed
+        time_increment = 0.016 * self.autoplay_speed
+        
+        # Advance current time
+        self.autoplay_current_time += time_increment
+        
+        # Get total duration
+        total_duration = self.full_time_axis[-1]
+        
+        # Check if we've reached the end
+        if self.autoplay_current_time >= total_duration - self.window_size_sec / 2:
+            # Loop back to beginning
+            self.autoplay_current_time = self.window_size_sec / 2
+        
+        # Calculate the view range centered on current time
+        half_window = self.window_size_sec / 2
+        t_start = self.autoplay_current_time - half_window
+        t_end = self.autoplay_current_time + half_window
+        
+        # Clamp to valid range
+        if t_start < self.full_time_axis[0]:
+            t_start = self.full_time_axis[0]
+            t_end = t_start + self.window_size_sec
+        if t_end > self.full_time_axis[-1]:
+            t_end = self.full_time_axis[-1]
+            t_start = t_end - self.window_size_sec
+        
+        # Update the view range and data (smoothly scroll the graph)
+        if self.display_mode == 'overlay':
+            # Set X range
+            self.plot_widget.setXRange(t_start, t_end, padding=0)
+            
+            # Update visible data for dynamic loading
+            view_range = [t_start, t_end]
+            start_idx, end_idx = self.get_visible_data_range(view_range)
+            
+            # Update data for each active channel
+            for ch_idx in sorted(self.active_channels):
+                if ch_idx in self.overlay_plot_items:
+                    data = self.raw_data[ch_idx, start_idx:end_idx]
+                    time_slice = self.full_time_axis[start_idx:end_idx]
+                    self.overlay_plot_items[ch_idx].setData(time_slice, data)
+        else:
+            # Stacked mode: update first plot (others are linked)
+            self.plot_widgets[0].setXRange(t_start, t_end, padding=0)
+            
+            # Update visible data for dynamic loading
+            view_range = [t_start, t_end]
+            start_idx, end_idx = self.get_visible_data_range(view_range)
+            
+            # Update data for all active channels
+            for ch_idx in self.active_channels:
+                if ch_idx in self.stacked_plot_items:
+                    data = self.raw_data[ch_idx, start_idx:end_idx]
+                    time_slice = self.full_time_axis[start_idx:end_idx]
+                    self.stacked_plot_items[ch_idx].setData(time_slice, data)
+        
+        # Update window controls to reflect current position
+        self.update_window_controls_from_view()
     
     def open_window_settings_dialog(self):
         """Open dialog to configure window display settings"""
