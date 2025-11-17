@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QCheckBox, QSlider, QSpinBox, QPushButton, QLabel, QGroupBox,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QRadioButton, QButtonGroup,
-    QFileDialog, QMessageBox
+    QFileDialog, QMessageBox, QComboBox
 )
 from PyQt5.QtCore import Qt, QTimer
 
@@ -80,6 +80,9 @@ class SegmentViewer(QMainWindow):
         # Track last processed horizontal zoom value to avoid expensive updates
         self.last_horizontal_zoom_value = None
         
+        # Vertical bounds mode: 'iqr' or 'minmax'
+        self.vertical_bounds_mode = 'iqr'
+        
         # Autoplay state
         self.autoplay_active = False
         self.autoplay_speed = 1.0  # 1x = real-time
@@ -121,16 +124,45 @@ class SegmentViewer(QMainWindow):
         plot_and_zoom_layout = QHBoxLayout(plot_and_zoom_widget)
         plot_and_zoom_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Vertical zoom slider (Y-axis zoom) on the left
+        # Vertical zoom controls on the left
+        vertical_zoom_widget = QWidget()
+        vertical_zoom_layout = QVBoxLayout(vertical_zoom_widget)
+        vertical_zoom_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Vertical zoom slider (Y-axis zoom)
         self.vertical_zoom_slider = QSlider(Qt.Vertical)
         self.vertical_zoom_slider.setMinimum(10)  # 10% zoom (zoomed out)
         self.vertical_zoom_slider.setMaximum(500)  # 500% zoom (zoomed in)
         self.vertical_zoom_slider.setValue(100)  # 100% = normal
         self.vertical_zoom_slider.setTickPosition(QSlider.TicksRight)
         self.vertical_zoom_slider.setTickInterval(50)
-        self.vertical_zoom_slider.valueChanged.connect(self.on_vertical_zoom_changed)
+        self.vertical_zoom_slider.valueChanged.connect(self.on_vertical_zoom_slider_changed)
         self.vertical_zoom_slider.setEnabled(False)  # Disabled until file loaded
-        plot_and_zoom_layout.addWidget(self.vertical_zoom_slider)
+        vertical_zoom_layout.addWidget(self.vertical_zoom_slider, stretch=1)
+        
+        # Vertical zoom spinbox for manual input (with decimal support)
+        self.vertical_zoom_spinbox = QDoubleSpinBox()
+        self.vertical_zoom_spinbox.setRange(0.01, 10000.0)  # Allow much wider range than slider, including tiny values
+        self.vertical_zoom_spinbox.setSingleStep(1.0)
+        self.vertical_zoom_spinbox.setDecimals(2)  # Allow 2 decimal places
+        self.vertical_zoom_spinbox.setValue(100.0)
+        self.vertical_zoom_spinbox.setSuffix("%")
+        self.vertical_zoom_spinbox.setMaximumWidth(80)
+        self.vertical_zoom_spinbox.setEnabled(False)  # Disabled until file loaded
+        self.vertical_zoom_spinbox.valueChanged.connect(self.on_vertical_zoom_spinbox_changed)
+        vertical_zoom_layout.addWidget(self.vertical_zoom_spinbox)
+        
+        # Vertical bounds mode dropdown
+        self.bounds_mode_combo = QComboBox()
+        self.bounds_mode_combo.addItems(["IQR Bounds", "Min-Max Bounds"])
+        self.bounds_mode_combo.setCurrentIndex(0)  # Start with IQR
+        self.bounds_mode_combo.setMaximumWidth(120)
+        self.bounds_mode_combo.setToolTip("Select vertical axis bounds calculation method")
+        self.bounds_mode_combo.currentIndexChanged.connect(self.on_bounds_mode_changed)
+        self.bounds_mode_combo.setEnabled(False)  # Disabled until file loaded
+        vertical_zoom_layout.addWidget(self.bounds_mode_combo)
+        
+        plot_and_zoom_layout.addWidget(vertical_zoom_widget)
         
         # Right side: plot container + horizontal zoom slider
         plot_column_widget = QWidget()
@@ -353,6 +385,8 @@ class SegmentViewer(QMainWindow):
             
             # Enable zoom sliders and spinboxes
             self.vertical_zoom_slider.setEnabled(True)
+            self.vertical_zoom_spinbox.setEnabled(True)
+            self.bounds_mode_combo.setEnabled(True)
             self.horizontal_zoom_slider.setEnabled(True)
             self.window_size_spinbox.setEnabled(True)
             self.sampling_rate_spinbox.setEnabled(True)
@@ -466,21 +500,30 @@ class SegmentViewer(QMainWindow):
             self.plot_widgets.append(plot)
     
     def prepare_data(self):
-        """Prepare data and calculate window parameters and IQR bounds"""
+        """Prepare data and calculate window parameters and vertical bounds"""
         self.recalculate_windows()
         
-        # Pre-calculate IQR bounds for entire dataset (per channel)
+        # Pre-calculate both IQR and min-max bounds for entire dataset (per channel)
         # This is expensive so only do it once when file is loaded
         self.channel_iqr_bounds = {}
+        self.channel_minmax_bounds = {}
+        
         for ch_idx in range(self.num_channels):
             # Get all data for this channel
             channel_data = self.raw_data[ch_idx, :]
+            
+            # IQR bounds
             q1 = np.quantile(channel_data, 0.25)
             q3 = np.quantile(channel_data, 0.75)
             iqr = q3 - q1
-            y_min = q1 - iqr * 5.0
-            y_max = q3 + iqr * 5.0
-            self.channel_iqr_bounds[ch_idx] = (y_min, y_max)
+            iqr_y_min = q1 - iqr * 5.0
+            iqr_y_max = q3 + iqr * 5.0
+            self.channel_iqr_bounds[ch_idx] = (iqr_y_min, iqr_y_max)
+            
+            # Min-Max bounds
+            minmax_y_min = np.min(channel_data)
+            minmax_y_max = np.max(channel_data)
+            self.channel_minmax_bounds[ch_idx] = (minmax_y_min, minmax_y_max)
     
     def recalculate_windows(self):
         """Recalculate window parameters (fast, no IQR calculation)"""
@@ -571,6 +614,56 @@ class SegmentViewer(QMainWindow):
         
         return best_bounds
     
+    def get_minmax_bounds_for_channels(self, channel_indices):
+        """Get the maximum min-max bounds across specified channels"""
+        if not channel_indices:
+            return (0, 1)  # Default if no channels
+        
+        # Find channel with greatest range
+        max_range = 0
+        best_bounds = None
+        for ch_idx in channel_indices:
+            y_min, y_max = self.channel_minmax_bounds[ch_idx]
+            range_size = y_max - y_min
+            if range_size > max_range:
+                max_range = range_size
+                best_bounds = (y_min, y_max)
+        
+        return best_bounds
+    
+    def get_bounds_for_channels(self, channel_indices):
+        """Get bounds based on current vertical bounds mode"""
+        if self.vertical_bounds_mode == 'iqr':
+            return self.get_iqr_bounds_for_channels(channel_indices)
+        else:  # 'minmax'
+            return self.get_minmax_bounds_for_channels(channel_indices)
+    
+    def get_channel_bounds(self, ch_idx):
+        """Get bounds for a single channel based on current mode"""
+        if self.vertical_bounds_mode == 'iqr':
+            return self.channel_iqr_bounds[ch_idx]
+        else:  # 'minmax'
+            return self.channel_minmax_bounds[ch_idx]
+    
+    def on_bounds_mode_changed(self, index):
+        """Handle bounds mode dropdown selection change
+        
+        Args:
+            index: 0 for IQR, 1 for Min-Max
+        """
+        if not self.file_loaded:
+            return
+        
+        # Update mode based on selection
+        if index == 0:
+            self.vertical_bounds_mode = 'iqr'
+        else:
+            self.vertical_bounds_mode = 'minmax'
+        
+        # Reapply current zoom level with new bounds
+        current_zoom = self.vertical_zoom_spinbox.value()
+        self.apply_vertical_zoom(current_zoom)
+    
     def custom_wheel_event(self, view_box, event):
         """Custom mouse wheel handler:
         - Horizontal scroll (left/right): Pan time axis
@@ -614,11 +707,11 @@ class SegmentViewer(QMainWindow):
         
         event.accept()
     
-    def on_vertical_zoom_changed(self, value):
-        """Handle vertical zoom slider changes (Y-axis zoom)
+    def apply_vertical_zoom(self, value):
+        """Apply vertical zoom to the plot (Y-axis zoom)
         
         Args:
-            value: Zoom percentage (10-500, where 100 = normal)
+            value: Zoom percentage (any positive value, where 100 = normal)
         """
         if not self.file_loaded or not self.active_channels:
             return
@@ -627,8 +720,8 @@ class SegmentViewer(QMainWindow):
         zoom_factor = value / 100.0
         
         if self.display_mode == 'overlay':
-            # Get current IQR bounds and scale them
-            y_min, y_max = self.get_iqr_bounds_for_channels(self.active_channels)
+            # Get current bounds based on mode and scale them
+            y_min, y_max = self.get_bounds_for_channels(self.active_channels)
             y_center = (y_min + y_max) / 2.0
             y_range = (y_max - y_min) / zoom_factor
             
@@ -639,13 +732,42 @@ class SegmentViewer(QMainWindow):
             # Stacked mode: scale each channel's Y range independently
             for ch_idx in self.active_channels:
                 plot = self.plot_widgets[ch_idx]
-                ch_y_min, ch_y_max = self.channel_iqr_bounds[ch_idx]
+                ch_y_min, ch_y_max = self.get_channel_bounds(ch_idx)
                 y_center = (ch_y_min + ch_y_max) / 2.0
                 y_range = (ch_y_max - ch_y_min) / zoom_factor
                 
                 new_y_min = y_center - y_range / 2.0
                 new_y_max = y_center + y_range / 2.0
                 plot.setYRange(new_y_min, new_y_max, padding=0)
+    
+    def on_vertical_zoom_slider_changed(self, value):
+        """Handle vertical zoom slider changes
+        
+        Args:
+            value: Slider value (10-500)
+        """
+        # Update spinbox to match slider
+        self.vertical_zoom_spinbox.blockSignals(True)
+        self.vertical_zoom_spinbox.setValue(value)
+        self.vertical_zoom_spinbox.blockSignals(False)
+        
+        # Apply the zoom
+        self.apply_vertical_zoom(value)
+    
+    def on_vertical_zoom_spinbox_changed(self, value):
+        """Handle vertical zoom spinbox changes
+        
+        Args:
+            value: Spinbox value (1-10000)
+        """
+        # Update slider to match spinbox (clamped to slider range)
+        slider_value = max(10, min(500, value))
+        self.vertical_zoom_slider.blockSignals(True)
+        self.vertical_zoom_slider.setValue(slider_value)
+        self.vertical_zoom_slider.blockSignals(False)
+        
+        # Apply the zoom with the actual spinbox value (not clamped)
+        self.apply_vertical_zoom(value)
     
     def sync_navigation_controls(self):
         """
@@ -845,7 +967,7 @@ class SegmentViewer(QMainWindow):
         if rebuild:
             current_zoom = self.vertical_zoom_slider.value()
             if current_zoom != 100:  # Only apply if zoom is not at default
-                self.on_vertical_zoom_changed(current_zoom)
+                self.apply_vertical_zoom(current_zoom)
     
     def get_visible_data_range(self, view_range):
         """Get the sample indices for the visible time range, with some padding"""
@@ -902,7 +1024,7 @@ class SegmentViewer(QMainWindow):
         
         # Only set Y range when channels change, not on every window update
         if set_y_range:
-            y_min, y_max = self.get_iqr_bounds_for_channels(self.active_channels)
+            y_min, y_max = self.get_bounds_for_channels(self.active_channels)
             self.plot_widget.setYRange(y_min, y_max, padding=0)
         
         # Set X-axis range to show current window
@@ -986,8 +1108,8 @@ class SegmentViewer(QMainWindow):
                 # Store plot item for dynamic updates
                 self.stacked_plot_items[i] = plot_item
                 
-                # Use individual channel's IQR bounds for separate Y-axis ranges
-                ch_y_min, ch_y_max = self.channel_iqr_bounds[i]
+                # Use current mode's bounds for separate Y-axis ranges
+                ch_y_min, ch_y_max = self.get_channel_bounds(i)
                 plot.setYRange(ch_y_min, ch_y_max, padding=0)
                 
                 # Set X-axis range to current window (only needed on first since they're linked)
@@ -1098,11 +1220,11 @@ class SegmentViewer(QMainWindow):
         t_start = self.full_time_axis[start_sample]
         t_end = self.full_time_axis[min(end_sample - 1, len(self.full_time_axis) - 1)]
         
-        # Get pre-calculated IQR bounds from channel with greatest range
-        y_min, y_max = self.get_iqr_bounds_for_channels(self.active_channels)
+        # Get pre-calculated bounds based on current mode from channel with greatest range
+        y_min, y_max = self.get_bounds_for_channels(self.active_channels)
         
         if self.display_mode == 'overlay':
-            # Reset to show current window time range and IQR bounds
+            # Reset to show current window time range and bounds
             self.plot_widget.setYRange(y_min, y_max, padding=0)
             self.plot_widget.setXRange(t_start, t_end, padding=0)
         else:
@@ -1110,8 +1232,8 @@ class SegmentViewer(QMainWindow):
             self.plot_widgets[0].setXRange(t_start, t_end, padding=0)
             for ch_idx in self.active_channels:
                 plot = self.plot_widgets[ch_idx]
-                # Get individual channel's IQR bounds
-                ch_y_min, ch_y_max = self.channel_iqr_bounds[ch_idx]
+                # Get individual channel's bounds based on current mode
+                ch_y_min, ch_y_max = self.get_channel_bounds(ch_idx)
                 plot.setYRange(ch_y_min, ch_y_max, padding=0)
     
     def toggle_autoplay(self):
