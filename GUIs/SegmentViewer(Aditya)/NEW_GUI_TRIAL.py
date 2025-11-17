@@ -1125,6 +1125,7 @@ class SegmentViewer(QMainWindow):
             # Entering autoplay mode
             self.autoplay_btn.setText("⏹ Exit Autoplay")
             self.playback_controls_widget.setVisible(True)
+            self.play_pause_btn.setText("⏸ Pause")  # Set to Pause since we're starting playback
             
             # Initialize autoplay position from current view
             if self.display_mode == 'overlay':
@@ -1244,6 +1245,20 @@ class SegmentViewer(QMainWindow):
                 self.update_plot()
                 
                 print(f"Display mode changed to: {self.display_mode}")
+    
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts"""
+        from PyQt5.QtCore import Qt
+        
+        # Spacebar toggles play/pause when in autoplay mode
+        if event.key() == Qt.Key_Space:
+            if self.autoplay_active:
+                self.toggle_play_pause()
+                event.accept()
+                return
+        
+        # Let the parent class handle other keys
+        super().keyPressEvent(event)
 
 
 def main():
