@@ -738,58 +738,50 @@ class SegmentViewer(QMainWindow):
                         plot_item = self.stacked_plot_items[ch_idx]
                         plot_item.setData(time_slice, offset_data)
                 
-                # Update tick labels (not positions) to reflect new zoom
-                left_axis = self.stacked_plot_item.getAxis('left')
-                
-                # Recalculate scale factor
-                all_values = []
-                for ch_idx in active_list:
-                    ch_min, ch_max = self.get_channel_bounds(ch_idx)
-                    all_values.extend([abs(ch_min), abs(ch_max)])
-                
-                max_abs_val = max(all_values) if all_values else 1.0
-                
-                if max_abs_val == 0:
-                    scale_factor = 1.0
-                else:
-                    scale_exponent = int(np.floor(np.log10(max_abs_val)))
-                    if max_abs_val < 0.01 or max_abs_val > 10000:
-                        scale_factor = 10 ** scale_exponent
-                    else:
+                # Update tick label text (not positions) to reflect new zoom
+                if hasattr(self, 'stacked_tick_labels') and self.stacked_tick_labels:
+                    # Recalculate scale factor
+                    all_values = []
+                    for ch_idx in active_list:
+                        ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                        all_values.extend([abs(ch_min), abs(ch_max)])
+                    
+                    max_abs_val = max(all_values) if all_values else 1.0
+                    
+                    if max_abs_val == 0:
                         scale_factor = 1.0
-                
-                tick_positions = []
-                for idx, ch_idx in enumerate(active_list):
-                    ch_min, ch_max = self.get_channel_bounds(ch_idx)
-                    vertical_offset = idx * channel_height + channel_height * 0.5
-                    
-                    # Calculate what amplitude the FIXED positions represent
-                    # Positions stay at +/- 0.4, but values change with zoom
-                    axis_half_range = (ch_max - ch_min) * 0.4 / zoom_factor
-                    axis_half_range_scaled = axis_half_range / scale_factor
-                    
-                    # Format labels
-                    if axis_half_range_scaled < 0.01 and axis_half_range_scaled > 0:
-                        upper_label = f"{axis_half_range_scaled:.2e}"
-                        lower_label = f"{-axis_half_range_scaled:.2e}"
-                    elif axis_half_range_scaled < 1:
-                        upper_label = f"{axis_half_range_scaled:.3f}"
-                        lower_label = f"{-axis_half_range_scaled:.3f}"
-                    elif axis_half_range_scaled < 100:
-                        upper_label = f"{axis_half_range_scaled:.2f}"
-                        lower_label = f"{-axis_half_range_scaled:.2f}"
                     else:
-                        upper_label = f"{axis_half_range_scaled:.1f}"
-                        lower_label = f"{-axis_half_range_scaled:.1f}"
+                        scale_exponent = int(np.floor(np.log10(max_abs_val)))
+                        if max_abs_val < 0.01 or max_abs_val > 10000:
+                            scale_factor = 10 ** scale_exponent
+                        else:
+                            scale_factor = 1.0
                     
-                    # Tick positions are FIXED, only labels change
-                    tick_positions.extend([
-                        (vertical_offset + 0.4, upper_label),
-                        (vertical_offset, "0"),
-                        (vertical_offset - 0.4, lower_label)
-                    ])
-                
-                left_axis.setTicks([tick_positions])
+                    for label_group in self.stacked_tick_labels:
+                        ch_idx = label_group['ch_idx']
+                        ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                        
+                        # Calculate what amplitude the FIXED positions represent
+                        axis_half_range = (ch_max - ch_min) * 0.4 / zoom_factor
+                        axis_half_range_scaled = axis_half_range / scale_factor
+                        
+                        # Format labels
+                        if axis_half_range_scaled < 0.01 and axis_half_range_scaled > 0:
+                            upper_label = f"{axis_half_range_scaled:.2e}"
+                            lower_label = f"{-axis_half_range_scaled:.2e}"
+                        elif axis_half_range_scaled < 1:
+                            upper_label = f"{axis_half_range_scaled:.3f}"
+                            lower_label = f"{-axis_half_range_scaled:.3f}"
+                        elif axis_half_range_scaled < 100:
+                            upper_label = f"{axis_half_range_scaled:.2f}"
+                            lower_label = f"{-axis_half_range_scaled:.2f}"
+                        else:
+                            upper_label = f"{axis_half_range_scaled:.1f}"
+                            lower_label = f"{-axis_half_range_scaled:.1f}"
+                        
+                        # Update text content
+                        label_group['upper'].setText(upper_label)
+                        label_group['lower'].setText(lower_label)
     
     def on_vertical_zoom_slider_changed(self, value):
         """Handle vertical zoom slider changes
@@ -1246,8 +1238,66 @@ class SegmentViewer(QMainWindow):
                     (vertical_offset - 0.4, lower_label)   # Lower bound - FIXED position
                 ])
             
-            # Set manual ticks
-            left_axis.setTicks([tick_positions])
+            # Set manual ticks (without labels - we'll use TextItems for colored labels)
+            # Just set tick marks without text
+            tick_marks = []
+            for idx, ch_idx in enumerate(active_list):
+                vertical_offset = idx * channel_height + channel_height * 0.5
+                tick_marks.extend([
+                    (vertical_offset + 0.4, ''),  # Upper bound
+                    (vertical_offset, ''),        # Center
+                    (vertical_offset - 0.4, '')   # Lower bound
+                ])
+            left_axis.setTicks([tick_marks])
+            
+            # Create colored TextItem labels for ticks
+            # Store them so we can update them later
+            self.stacked_tick_labels = []
+            
+            for idx, ch_idx in enumerate(active_list):
+                info = self.stacked_y_axes[ch_idx]
+                ch_min = info['ch_min']
+                ch_max = info['ch_max']
+                color = info['color']
+                vertical_offset = idx * channel_height + channel_height * 0.5
+                
+                # Calculate the axis range
+                axis_half_range = (ch_max - ch_min) * 0.4 / self.stacked_vertical_zoom
+                axis_half_range_scaled = axis_half_range / scale_factor
+                
+                # Format labels
+                if axis_half_range_scaled < 0.01 and axis_half_range_scaled > 0:
+                    upper_label = f"{axis_half_range_scaled:.2e}"
+                    lower_label = f"{-axis_half_range_scaled:.2e}"
+                elif axis_half_range_scaled < 1:
+                    upper_label = f"{axis_half_range_scaled:.3f}"
+                    lower_label = f"{-axis_half_range_scaled:.3f}"
+                elif axis_half_range_scaled < 100:
+                    upper_label = f"{axis_half_range_scaled:.2f}"
+                    lower_label = f"{-axis_half_range_scaled:.2f}"
+                else:
+                    upper_label = f"{axis_half_range_scaled:.1f}"
+                    lower_label = f"{-axis_half_range_scaled:.1f}"
+                
+                # Create TextItems for upper, center, and lower labels
+                # anchor=(1, 0.5) means right-aligned, vertically centered
+                upper_text = pg.TextItem(upper_label, color=color, anchor=(1, 0.5))
+                center_text = pg.TextItem("0", color=color, anchor=(1, 0.5))
+                lower_text = pg.TextItem(lower_label, color=color, anchor=(1, 0.5))
+                
+                # Store references
+                self.stacked_tick_labels.append({
+                    'upper': upper_text,
+                    'center': center_text,
+                    'lower': lower_text,
+                    'ch_idx': ch_idx,
+                    'vertical_offset': vertical_offset
+                })
+                
+                # Add to plot
+                self.stacked_plot_item.addItem(upper_text)
+                self.stacked_plot_item.addItem(center_text)
+                self.stacked_plot_item.addItem(lower_text)
             
             # Color the axis labels based on which channel region they're in
             left_axis.setTextPen('w')  # Default white
@@ -1308,12 +1358,26 @@ class SegmentViewer(QMainWindow):
                 
                 # Store plot item for dynamic updates
                 self.stacked_plot_items[ch_idx] = plot_item
+                
+                # Add a faint horizontal zero-line for this channel (same color as channel, low opacity)
+                # Get the color and make it semi-transparent
+                line_color = pg.mkColor(color)
+                line_color.setAlpha(90)  # Low opacity for faint appearance
+                zero_line = pg.InfiniteLine(
+                    pos=vertical_offset,
+                    angle=0,
+                    pen=pg.mkPen(color=line_color, width=1, style=pg.QtCore.Qt.DashLine)
+                )
+                self.stacked_plot_item.addItem(zero_line)
             
             # Set Y range to show all channels with some padding
             self.stacked_plot_item.setYRange(-0.2, total_height + 0.2, padding=0)
             
             # Set X range to current window
             self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
+            
+            # Position tick labels at left edge of visible range
+            self.update_stacked_tick_label_positions()
             
             # Add legend
             self.stacked_plot_item.addLegend()
@@ -1347,6 +1411,32 @@ class SegmentViewer(QMainWindow):
             
             # Update X range
             self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
+            
+            # Update tick label positions
+            self.update_stacked_tick_label_positions()
+    
+    def update_stacked_tick_label_positions(self):
+        """Update positions of tick labels to stay at left edge of visible range"""
+        if not hasattr(self, 'stacked_tick_labels') or not self.stacked_tick_labels:
+            return
+        
+        if self.stacked_plot_item is None:
+            return
+        
+        # Get current visible X range
+        x_range = self.stacked_plot_item.viewRange()[0]
+        x_left = x_range[0]
+        
+        # Position labels at left edge with offset to avoid axis overlap
+        label_x = x_left + (x_range[1] - x_range[0]) * 0.05  # 5% from left edge
+        
+        for label_group in self.stacked_tick_labels:
+            vertical_offset = label_group['vertical_offset']
+            
+            # Position upper, center, and lower labels
+            label_group['upper'].setPos(label_x, vertical_offset + 0.4)
+            label_group['center'].setPos(label_x, vertical_offset)
+            label_group['lower'].setPos(label_x, vertical_offset - 0.4)
     
     def on_stacked_range_changed(self):
         """Called when user zooms or pans in stacked mode - updates visible data for all channels"""
@@ -1387,6 +1477,9 @@ class SegmentViewer(QMainWindow):
                 # Update plot item
                 plot_item = self.stacked_plot_items[ch_idx]
                 plot_item.setData(time_slice, offset_data)
+        
+        # Update tick label positions to stay at left edge
+        self.update_stacked_tick_label_positions()
     
     def navigate_to_window(self, value):
         """Navigate to a specific window and update the view
