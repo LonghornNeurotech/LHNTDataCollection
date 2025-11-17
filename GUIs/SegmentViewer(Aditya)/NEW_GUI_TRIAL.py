@@ -83,6 +83,9 @@ class SegmentViewer(QMainWindow):
         # Vertical bounds mode: 'iqr' or 'minmax'
         self.vertical_bounds_mode = 'iqr'
         
+        # Vertical zoom factor for stacked mode (amplitude scaling)
+        self.stacked_vertical_zoom = 1.0
+        
         # Autoplay state
         self.autoplay_active = False
         self.autoplay_speed = 1.0  # 1x = real-time
@@ -123,6 +126,9 @@ class SegmentViewer(QMainWindow):
         plot_and_zoom_widget = QWidget()
         plot_and_zoom_layout = QHBoxLayout(plot_and_zoom_widget)
         plot_and_zoom_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Set minimum height for plot area to ensure controls are accessible
+        plot_and_zoom_widget.setMinimumHeight(400)
         
         # Vertical zoom controls on the left
         vertical_zoom_widget = QWidget()
@@ -172,6 +178,8 @@ class SegmentViewer(QMainWindow):
         # Plot container (will be replaced when switching modes)
         self.plot_container = QWidget()
         self.plot_layout = QVBoxLayout(self.plot_container)
+        self.plot_layout.setSpacing(0)  # Remove spacing between plots for tight stacking
+        self.plot_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins
         plot_column_layout.addWidget(self.plot_container, stretch=1)  # Give plot area most of the space
         
         # Horizontal zoom slider (X-axis/time zoom) on the bottom
@@ -444,60 +452,27 @@ class SegmentViewer(QMainWindow):
         self.overlay_plot_items = {}
     
     def setup_stacked_mode(self):
-        """Setup multiple plot widgets for stacked display with linked X-axes"""
+        """Setup single plot widget with vertically offset channels and multiple Y-axes"""
         # Clear existing plots
         while self.plot_layout.count():
             child = self.plot_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
         
-        # Create separate plot widget for each channel
-        self.plot_widgets = []
-        self.stacked_plot_items = {}  # Dictionary to store plot items for each channel
+        # Create a graphics layout widget to hold everything
+        self.plot_widget = pg.GraphicsLayoutWidget()
         
-        # Keep track of first plot to link X-axes
-        first_plot = None
+        # Create a single plot item - will be recreated when channels are selected
+        self.stacked_plot_item = None
         
-        for i in range(self.num_channels):
-            plot = pg.PlotWidget()
-            plot.setLabel('left', f'Ch{i+1}')
-            
-            # Only show X-axis on the last channel
-            if i == self.num_channels - 1:
-                plot.setLabel('bottom', 'Time (seconds)')
-            else:
-                # Hide X-axis for non-bottom plots to save space
-                plot.getAxis('bottom').setStyle(showValues=False)
-                plot.getAxis('bottom').setHeight(0)  # Remove space allocated for axis
-            
-            plot.showGrid(x=True, y=True, alpha=0.3)
-            
-            # Link X-axis to first plot (so all channels share same time axis)
-            if i == 0:
-                first_plot = plot
-            else:
-                # Link this plot's X-axis to the first plot
-                plot.setXLink(first_plot)
-            
-            # Disable default mouse wheel behavior and add custom zoom
-            plot.setMouseEnabled(x=True, y=True)
-            view_box = plot.getViewBox()
-            view_box.setMouseMode(pg.ViewBox.RectMode)
-            
-            # Install custom wheel event using a closure that properly captures view_box
-            def make_wheel_handler(vb):
-                return lambda event: self.custom_wheel_event(vb, event)
-            view_box.wheelEvent = make_wheel_handler(view_box)
-            
-            # Connect range change signal for dynamic updates
-            # Only connect for first plot since X-axes are linked
-            if i == 0:
-                def make_range_handler(ch):
-                    return lambda: self.on_stacked_range_changed(ch)
-                plot.sigRangeChanged.connect(make_range_handler(i))
-            
-            # Don't add to layout yet - will be added dynamically in update_plot_stacked
-            self.plot_widgets.append(plot)
+        self.plot_layout.addWidget(self.plot_widget)
+        self.plot_widgets = []  # Will be set when plot is created
+        
+        # Dictionary to store plot items for each channel
+        self.stacked_plot_items = {}
+        
+        # Dictionary to store Y-axis items for each channel
+        self.stacked_y_axes = {}
     
     def prepare_data(self):
         """Prepare data and calculate window parameters and vertical bounds"""
@@ -571,8 +546,10 @@ class SegmentViewer(QMainWindow):
         if self.display_mode == 'overlay':
             view_range = self.plot_widget.viewRange()[0]  # [x_min, x_max]
         else:
-            # In stacked mode, all X-axes are linked, so use first plot
-            view_range = self.plot_widgets[0].viewRange()[0]
+            # In stacked mode, use stacked_plot_item
+            if self.stacked_plot_item is None:
+                return
+            view_range = self.stacked_plot_item.viewRange()[0]
         
         # Calculate center of visible range
         t_center = (view_range[0] + view_range[1]) / 2.0
@@ -729,16 +706,90 @@ class SegmentViewer(QMainWindow):
             new_y_max = y_center + y_range / 2.0
             self.plot_widget.setYRange(new_y_min, new_y_max, padding=0)
         else:
-            # Stacked mode: scale each channel's Y range independently
-            for ch_idx in self.active_channels:
-                plot = self.plot_widgets[ch_idx]
-                ch_y_min, ch_y_max = self.get_channel_bounds(ch_idx)
-                y_center = (ch_y_min + ch_y_max) / 2.0
-                y_range = (ch_y_max - ch_y_min) / zoom_factor
+            # Stacked mode: just update the zoom factor (will be applied in next data update)
+            self.stacked_vertical_zoom = zoom_factor
+            
+            # Manually update the existing plot items with new zoom
+            if self.active_channels and self.stacked_plot_items and self.stacked_plot_item is not None:
+                # Get current view range
+                view_range = self.stacked_plot_item.viewRange()[0]
+                start_idx, end_idx = self.get_visible_data_range(view_range)
                 
-                new_y_min = y_center - y_range / 2.0
-                new_y_max = y_center + y_range / 2.0
-                plot.setYRange(new_y_min, new_y_max, padding=0)
+                # Update each channel with new zoom
+                active_list = sorted(self.active_channels)
+                channel_height = 1.0
+                
+                for idx, ch_idx in enumerate(active_list):
+                    if ch_idx in self.stacked_plot_items:
+                        data = self.raw_data[ch_idx, start_idx:end_idx]
+                        time_slice = self.full_time_axis[start_idx:end_idx]
+                        
+                        ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                        data_range = ch_max - ch_min
+                        if data_range > 0:
+                            # Center the data around 0, then scale, then offset
+                            normalized_data = ((data - ch_min) / data_range - 0.5) * channel_height * 0.8 * zoom_factor
+                        else:
+                            normalized_data = np.zeros_like(data)
+                        
+                        vertical_offset = idx * channel_height + channel_height * 0.5
+                        offset_data = normalized_data + vertical_offset
+                        
+                        plot_item = self.stacked_plot_items[ch_idx]
+                        plot_item.setData(time_slice, offset_data)
+                
+                # Update tick labels (not positions) to reflect new zoom
+                left_axis = self.stacked_plot_item.getAxis('left')
+                
+                # Recalculate scale factor
+                all_values = []
+                for ch_idx in active_list:
+                    ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                    all_values.extend([abs(ch_min), abs(ch_max)])
+                
+                max_abs_val = max(all_values) if all_values else 1.0
+                
+                if max_abs_val == 0:
+                    scale_factor = 1.0
+                else:
+                    scale_exponent = int(np.floor(np.log10(max_abs_val)))
+                    if max_abs_val < 0.01 or max_abs_val > 10000:
+                        scale_factor = 10 ** scale_exponent
+                    else:
+                        scale_factor = 1.0
+                
+                tick_positions = []
+                for idx, ch_idx in enumerate(active_list):
+                    ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                    vertical_offset = idx * channel_height + channel_height * 0.5
+                    
+                    # Calculate what amplitude the FIXED positions represent
+                    # Positions stay at +/- 0.4, but values change with zoom
+                    axis_half_range = (ch_max - ch_min) * 0.4 / zoom_factor
+                    axis_half_range_scaled = axis_half_range / scale_factor
+                    
+                    # Format labels
+                    if axis_half_range_scaled < 0.01 and axis_half_range_scaled > 0:
+                        upper_label = f"{axis_half_range_scaled:.2e}"
+                        lower_label = f"{-axis_half_range_scaled:.2e}"
+                    elif axis_half_range_scaled < 1:
+                        upper_label = f"{axis_half_range_scaled:.3f}"
+                        lower_label = f"{-axis_half_range_scaled:.3f}"
+                    elif axis_half_range_scaled < 100:
+                        upper_label = f"{axis_half_range_scaled:.2f}"
+                        lower_label = f"{-axis_half_range_scaled:.2f}"
+                    else:
+                        upper_label = f"{axis_half_range_scaled:.1f}"
+                        lower_label = f"{-axis_half_range_scaled:.1f}"
+                    
+                    # Tick positions are FIXED, only labels change
+                    tick_positions.extend([
+                        (vertical_offset + 0.4, upper_label),
+                        (vertical_offset, "0"),
+                        (vertical_offset - 0.4, lower_label)
+                    ])
+                
+                left_axis.setTicks([tick_positions])
     
     def on_vertical_zoom_slider_changed(self, value):
         """Handle vertical zoom slider changes
@@ -761,7 +812,7 @@ class SegmentViewer(QMainWindow):
             value: Spinbox value (1-10000)
         """
         # Update slider to match spinbox (clamped to slider range)
-        slider_value = max(10, min(500, value))
+        slider_value = int(max(10, min(500, value)))
         self.vertical_zoom_slider.blockSignals(True)
         self.vertical_zoom_slider.setValue(slider_value)
         self.vertical_zoom_slider.blockSignals(False)
@@ -962,12 +1013,6 @@ class SegmentViewer(QMainWindow):
             self.update_plot_overlay(set_y_range=rebuild)
         else:
             self.update_plot_stacked(rebuild_layout=rebuild)
-        
-        # Apply current vertical zoom value after any plot update
-        if rebuild:
-            current_zoom = self.vertical_zoom_slider.value()
-            if current_zoom != 100:  # Only apply if zoom is not at default
-                self.apply_vertical_zoom(current_zoom)
     
     def get_visible_data_range(self, view_range):
         """Get the sample indices for the visible time range, with some padding"""
@@ -1052,11 +1097,11 @@ class SegmentViewer(QMainWindow):
                 self.overlay_plot_items[ch_idx].setData(time_slice, data)
     
     def update_plot_stacked(self, rebuild_layout=True):
-        """Update plots in stacked mode - plots only visible data
+        """Update plots in stacked mode - all channels on one plot with vertical offsets
         
         Args:
-            rebuild_layout: If True, rebuild layout (when channels change). 
-                          If False, just update X-axis bounds (when navigating windows).
+            rebuild_layout: If True, rebuild plot items (when channels change). 
+                          If False, just update data (when navigating windows).
         """
         colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
         
@@ -1069,93 +1114,279 @@ class SegmentViewer(QMainWindow):
         view_range = [t_start, t_end]
         start_idx, end_idx = self.get_visible_data_range(view_range)
         
-        # Check if we need to rebuild layout (channels changed)
+        # Calculate vertical spacing between channels
+        active_list = sorted(self.active_channels)
+        num_active = len(active_list)
+        
+        if num_active == 0:
+            return
+        
+        # Calculate the range needed for each channel and total offset spacing
+        # We'll normalize each channel to a standard height and offset them
+        channel_height = 1.0  # Normalized height for each channel
+        total_height = num_active * channel_height
+        
+        # Check if we need to rebuild (channels changed)
         if rebuild_layout or self.active_channels != self.last_stacked_channels:
-            # Clear the layout
-            while self.plot_layout.count():
-                child = self.plot_layout.takeAt(0)
-                if child.widget():
-                    # Remove from layout but don't delete the widget
-                    child.widget().setParent(None)
-            
-            # Clear stacked plot items
+            # Clear the entire graphics layout
+            self.plot_widget.clear()
             self.stacked_plot_items.clear()
+            self.stacked_y_axes.clear()
             
-            # Add only active channel plots to layout
-            active_list = sorted(self.active_channels)
-            for idx, i in enumerate(active_list):
-                plot = self.plot_widgets[i]
-                plot.clear()
+            # All axes and the plot will share row 0, with axes stacked in column 0
+            # Create Y-axes for each channel first
+            for idx, ch_idx in enumerate(active_list):
+                # Get bounds for this channel
+                ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                color = colors[ch_idx % len(colors)]
                 
-                # Update X-axis visibility - only the last visible plot should show it
-                if idx == len(active_list) - 1:
-                    # This is the bottom plot - show X-axis
-                    plot.setLabel('bottom', 'Time (seconds)')
-                    plot.getAxis('bottom').setStyle(showValues=True)
-                    plot.getAxis('bottom').setHeight(None)  # Use default height
+                # Create axis item
+                axis = pg.AxisItem(orientation='left')
+                axis.setPen(color)
+                axis.setTextPen(color)
+                axis.setLabel(f'Ch{ch_idx+1}', color=color)
+                
+                # Calculate vertical position for this channel
+                vertical_offset = idx * channel_height + channel_height * 0.5
+                span = channel_height * 0.8 * self.stacked_vertical_zoom
+                
+                # Add axis to column 0 at its position
+                # Note: We can't vertically position axes independently in pyqtgraph layout
+                # So we'll use a different approach - just show one axis with custom ticks
+                
+                # Store axis info for later
+                self.stacked_y_axes[ch_idx] = {
+                    'axis': axis,
+                    'ch_min': ch_min,
+                    'ch_max': ch_max,
+                    'vertical_offset': vertical_offset,
+                    'span': span,
+                    'idx': idx,
+                    'color': color
+                }
+            
+            # Create the main plot item - it will span all rows
+            self.stacked_plot_item = self.plot_widget.addPlot(row=0, col=0, rowspan=num_active)
+            self.stacked_plot_item.setLabel('bottom', 'Time (seconds)')
+            self.stacked_plot_item.showGrid(x=True, y=False, alpha=0.3)
+            
+            # Keep the default left axis but customize it
+            left_axis = self.stacked_plot_item.getAxis('left')
+            left_axis.setLabel('')  # Remove label
+            
+            # Determine the overall scale factor for displaying values
+            # Find the max absolute value across all channels to determine scale
+            all_values = []
+            for ch_idx in active_list:
+                ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                all_values.extend([abs(ch_min), abs(ch_max)])
+            
+            max_abs_val = max(all_values) if all_values else 1.0
+            
+            # Determine appropriate scale factor
+            if max_abs_val == 0:
+                scale_exponent = 0
+                scale_factor = 1.0
+            else:
+                scale_exponent = int(np.floor(np.log10(max_abs_val)))
+                # Use scale for very small (< 0.01) or very large (> 10000) numbers
+                if max_abs_val < 0.01 or max_abs_val > 10000:
+                    scale_factor = 10 ** scale_exponent
                 else:
-                    # Not the bottom plot - hide X-axis to save space
-                    plot.setLabel('bottom', '')
-                    plot.getAxis('bottom').setStyle(showValues=False)
-                    plot.getAxis('bottom').setHeight(0)
+                    scale_factor = 1.0
+                    scale_exponent = 0
+            
+            # Add scale label if needed
+            if scale_exponent != 0:
+                # Format the exponent nicely
+                if scale_exponent > 0:
+                    scale_text = f'×10^{scale_exponent}'
+                else:
+                    scale_text = f'×10^{scale_exponent}'
                 
-                # Plot only visible data for this channel
-                data = self.raw_data[i, start_idx:end_idx]
+                # Add the scale indicator to the axis label
+                left_axis.setLabel(scale_text)
+                # Set label color (the label is a QGraphicsTextItem)
+                left_axis.label.setDefaultTextColor(pg.mkColor('w'))
+            
+            # Create tick positions with labels showing bounds
+            tick_positions = []
+            for idx, ch_idx in enumerate(active_list):
+                info = self.stacked_y_axes[ch_idx]
+                ch_min = info['ch_min']
+                ch_max = info['ch_max']
+                vertical_offset = idx * channel_height + channel_height * 0.5
+                
+                # Calculate the axis range (what the segment represents)
+                # Positions are FIXED at +/- 0.4 from center (based on 100% zoom)
+                # But the VALUES they represent change with zoom
+                axis_half_range = (ch_max - ch_min) * 0.4 / self.stacked_vertical_zoom
+                
+                # Apply scale factor
+                axis_half_range_scaled = axis_half_range / scale_factor
+                
+                # Format labels based on magnitude
+                if axis_half_range_scaled < 0.01 and axis_half_range_scaled > 0:
+                    upper_label = f"{axis_half_range_scaled:.2e}"
+                    lower_label = f"{-axis_half_range_scaled:.2e}"
+                elif axis_half_range_scaled < 1:
+                    upper_label = f"{axis_half_range_scaled:.3f}"
+                    lower_label = f"{-axis_half_range_scaled:.3f}"
+                elif axis_half_range_scaled < 100:
+                    upper_label = f"{axis_half_range_scaled:.2f}"
+                    lower_label = f"{-axis_half_range_scaled:.2f}"
+                else:
+                    upper_label = f"{axis_half_range_scaled:.1f}"
+                    lower_label = f"{-axis_half_range_scaled:.1f}"
+                
+                # Tick positions are FIXED at +/- 0.4 (as if zoom were 100%)
+                tick_positions.extend([
+                    (vertical_offset + 0.4, upper_label),  # Upper bound - FIXED position
+                    (vertical_offset, "0"),                 # Center (0) - FIXED position
+                    (vertical_offset - 0.4, lower_label)   # Lower bound - FIXED position
+                ])
+            
+            # Set manual ticks
+            left_axis.setTicks([tick_positions])
+            
+            # Color the axis labels based on which channel region they're in
+            left_axis.setTextPen('w')  # Default white
+            
+            # Setup mouse events
+            self.stacked_plot_item.setMouseEnabled(x=True, y=True)
+            view_box = self.stacked_plot_item.getViewBox()
+            view_box.setMouseMode(pg.ViewBox.RectMode)
+            
+            def make_wheel_handler(vb):
+                return lambda event: self.custom_wheel_event(vb, event)
+            view_box.wheelEvent = make_wheel_handler(view_box)
+            
+            # Connect range change signal
+            self.stacked_plot_item.sigRangeChanged.connect(self.on_stacked_range_changed)
+            
+            # Update plot_widgets for compatibility
+            self.plot_widgets = [self.stacked_plot_item]
+            
+            # Add channel labels as TextItems
+            for idx, ch_idx in enumerate(active_list):
+                info = self.stacked_y_axes[ch_idx]
+                color = info['color']
+                vertical_offset = info['vertical_offset']
+                
+                # Add channel label
+                label = pg.TextItem(f'Ch{ch_idx+1}', color=color, anchor=(1, 0.5))
+                label.setPos(t_start, vertical_offset)
+                self.stacked_plot_item.addItem(label)
+            
+            # Plot each active channel with vertical offset
+            for idx, ch_idx in enumerate(active_list):
+                # Get data and normalize it
+                data = self.raw_data[ch_idx, start_idx:end_idx]
                 time_slice = self.full_time_axis[start_idx:end_idx]
-                color = colors[i % len(colors)]
-                plot_item = plot.plot(time_slice, data, pen=pg.mkPen(color=color, width=2))
+                
+                # Normalize channel data to fit within one channel_height unit
+                ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                data_range = ch_max - ch_min
+                if data_range > 0:
+                    # Center the data around 0, then scale, then offset
+                    normalized_data = ((data - ch_min) / data_range - 0.5) * channel_height * 0.8 * self.stacked_vertical_zoom
+                else:
+                    normalized_data = np.zeros_like(data)
+                
+                # Apply vertical offset (to center of channel's space)
+                vertical_offset = idx * channel_height + channel_height * 0.5
+                offset_data = normalized_data + vertical_offset
+                
+                # Plot with color
+                color = colors[ch_idx % len(colors)]
+                plot_item = self.stacked_plot_item.plot(
+                    time_slice,
+                    offset_data,
+                    pen=pg.mkPen(color=color, width=1.5),
+                    name=f'Ch{ch_idx+1}'
+                )
                 
                 # Store plot item for dynamic updates
-                self.stacked_plot_items[i] = plot_item
-                
-                # Use current mode's bounds for separate Y-axis ranges
-                ch_y_min, ch_y_max = self.get_channel_bounds(i)
-                plot.setYRange(ch_y_min, ch_y_max, padding=0)
-                
-                # Set X-axis range to current window (only needed on first since they're linked)
-                if idx == 0:
-                    plot.setXRange(t_start, t_end, padding=0)
-                
-                # Add to layout with equal stretch
-                self.plot_layout.addWidget(plot, stretch=1)
-                plot.show()
+                self.stacked_plot_items[ch_idx] = plot_item
             
-            # Remember which channels are in the layout
+            # Set Y range to show all channels with some padding
+            self.stacked_plot_item.setYRange(-0.2, total_height + 0.2, padding=0)
+            
+            # Set X range to current window
+            self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
+            
+            # Add legend
+            self.stacked_plot_item.addLegend()
+            
+            # Remember which channels are displayed
             self.last_stacked_channels = self.active_channels.copy()
         else:
-            # Update X-axis bounds (only on first plot since they're linked)
-            self.plot_widgets[list(self.active_channels)[0]].setXRange(t_start, t_end, padding=0)
-            
-            # Update visible data for all channels
-            for i in self.active_channels:
-                if i in self.stacked_plot_items:
-                    data = self.raw_data[i, start_idx:end_idx]
+            # Just update data for existing plot items
+            for idx, ch_idx in enumerate(active_list):
+                if ch_idx in self.stacked_plot_items:
+                    # Get data and normalize it
+                    data = self.raw_data[ch_idx, start_idx:end_idx]
                     time_slice = self.full_time_axis[start_idx:end_idx]
-                    self.stacked_plot_items[i].setData(time_slice, data)
+                    
+                    # Normalize channel data
+                    ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                    data_range = ch_max - ch_min
+                    if data_range > 0:
+                        # Center the data around 0, then scale, then offset
+                        normalized_data = ((data - ch_min) / data_range - 0.5) * channel_height * 0.8 * self.stacked_vertical_zoom
+                    else:
+                        normalized_data = np.zeros_like(data)
+                    
+                    # Apply vertical offset (to center of channel's space)
+                    vertical_offset = idx * channel_height + channel_height * 0.5
+                    offset_data = normalized_data + vertical_offset
+                    
+                    # Update plot item
+                    plot_item = self.stacked_plot_items[ch_idx]
+                    plot_item.setData(time_slice, offset_data)
+            
+            # Update X range
+            self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
     
-    def on_stacked_range_changed(self, channel_idx):
-        """Called when user zooms or pans in stacked mode - updates visible data for all channels
-        
-        Since X-axes are linked, we only need to connect this to the first plot.
-        When it fires, we update all active channels.
-        """
-        if not self.file_loaded or not self.active_channels:
+    def on_stacked_range_changed(self):
+        """Called when user zooms or pans in stacked mode - updates visible data for all channels"""
+        if not self.file_loaded or not self.active_channels or self.stacked_plot_item is None:
             return
         
         # Update window controls to match current view
         self.update_window_controls_from_view()
         
-        # Get the X range from first plot (all are linked)
-        plot = self.plot_widgets[0]
-        view_range = plot.viewRange()[0]  # [x_min, x_max]
+        # Get the X range from plot
+        view_range = self.stacked_plot_item.viewRange()[0]  # [x_min, x_max]
         start_idx, end_idx = self.get_visible_data_range(view_range)
         
+        # Calculate vertical spacing
+        active_list = sorted(self.active_channels)
+        channel_height = 1.0
+        
         # Update data for all active channels
-        for ch_idx in self.active_channels:
+        for idx, ch_idx in enumerate(active_list):
             if ch_idx in self.stacked_plot_items:
+                # Get data and normalize it
                 data = self.raw_data[ch_idx, start_idx:end_idx]
                 time_slice = self.full_time_axis[start_idx:end_idx]
-                self.stacked_plot_items[ch_idx].setData(time_slice, data)
+                
+                # Normalize channel data
+                ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                data_range = ch_max - ch_min
+                if data_range > 0:
+                    # Center the data around 0, then scale, then offset
+                    normalized_data = ((data - ch_min) / data_range - 0.5) * channel_height * 0.8 * self.stacked_vertical_zoom
+                else:
+                    normalized_data = np.zeros_like(data)
+                
+                # Apply vertical offset (to center of channel's space)
+                vertical_offset = idx * channel_height + channel_height * 0.5
+                offset_data = normalized_data + vertical_offset
+                
+                # Update plot item
+                plot_item = self.stacked_plot_items[ch_idx]
+                plot_item.setData(time_slice, offset_data)
     
     def navigate_to_window(self, value):
         """Navigate to a specific window and update the view
@@ -1184,7 +1415,8 @@ class SegmentViewer(QMainWindow):
         if self.display_mode == 'overlay':
             self.plot_widget.setXRange(t_start, t_end, padding=0)
         else:
-            self.plot_widgets[0].setXRange(t_start, t_end, padding=0)
+            if self.stacked_plot_item is not None:
+                self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
         
         # Update plot data and apply zoom
         self.update_plot()
@@ -1228,13 +1460,16 @@ class SegmentViewer(QMainWindow):
             self.plot_widget.setYRange(y_min, y_max, padding=0)
             self.plot_widget.setXRange(t_start, t_end, padding=0)
         else:
-            # Stacked mode: X-axes are linked, set each channel's own Y bounds
-            self.plot_widgets[0].setXRange(t_start, t_end, padding=0)
-            for ch_idx in self.active_channels:
-                plot = self.plot_widgets[ch_idx]
-                # Get individual channel's bounds based on current mode
-                ch_y_min, ch_y_max = self.get_channel_bounds(ch_idx)
-                plot.setYRange(ch_y_min, ch_y_max, padding=0)
+            # Stacked mode: Set X range and reset Y range to show all channels
+            if self.stacked_plot_item is not None:
+                self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
+                
+                # Calculate total height needed for all active channels
+                num_active = len(self.active_channels)
+                channel_height = 1.0
+                total_height = num_active * channel_height
+                # Add padding and account for centering (channels go from 0.5 to total_height - 0.5)
+                self.stacked_plot_item.setYRange(-0.2, total_height + 0.2, padding=0)
     
     def toggle_autoplay(self):
         """Toggle autoplay mode on/off"""
@@ -1332,19 +1567,41 @@ class SegmentViewer(QMainWindow):
                     time_slice = self.full_time_axis[start_idx:end_idx]
                     self.overlay_plot_items[ch_idx].setData(time_slice, data)
         else:
-            # Stacked mode: update first plot (others are linked)
-            self.plot_widgets[0].setXRange(t_start, t_end, padding=0)
+            # Stacked mode: update plot with offsets
+            if self.stacked_plot_item is not None:
+                self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
             
             # Update visible data for dynamic loading
             view_range = [t_start, t_end]
             start_idx, end_idx = self.get_visible_data_range(view_range)
             
-            # Update data for all active channels
-            for ch_idx in self.active_channels:
+            # Calculate vertical spacing
+            active_list = sorted(self.active_channels)
+            channel_height = 1.0
+            
+            # Update data for all active channels with offsets
+            for idx, ch_idx in enumerate(active_list):
                 if ch_idx in self.stacked_plot_items:
+                    # Get data and normalize it
                     data = self.raw_data[ch_idx, start_idx:end_idx]
                     time_slice = self.full_time_axis[start_idx:end_idx]
-                    self.stacked_plot_items[ch_idx].setData(time_slice, data)
+                    
+                    # Normalize channel data
+                    ch_min, ch_max = self.get_channel_bounds(ch_idx)
+                    data_range = ch_max - ch_min
+                    if data_range > 0:
+                        # Center the data around 0, then scale, then offset
+                        normalized_data = ((data - ch_min) / data_range - 0.5) * channel_height * 0.8 * self.stacked_vertical_zoom
+                    else:
+                        normalized_data = np.zeros_like(data)
+                    
+                    # Apply vertical offset (to center of channel's space)
+                    vertical_offset = idx * channel_height + channel_height * 0.5
+                    offset_data = normalized_data + vertical_offset
+                    
+                    # Update plot item
+                    plot_item = self.stacked_plot_items[ch_idx]
+                    plot_item.setData(time_slice, offset_data)
         
         # Update window controls to reflect current position
         self.update_window_controls_from_view()
