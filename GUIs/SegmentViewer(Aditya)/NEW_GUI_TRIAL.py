@@ -10,52 +10,162 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QCheckBox, QSlider, QSpinBox, QPushButton, QLabel, QGroupBox,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QRadioButton, QButtonGroup,
-    QFileDialog, QMessageBox, QComboBox
+    QFileDialog, QMessageBox, QComboBox, QLineEdit, QTabWidget, QMenu, QWidgetAction, QScrollArea
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QSize
+from PyQt5.QtGui import QPalette, QColor
+import platform
+from datetime import datetime
+import os
+
+# Serial port imports
+try:
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+    print("Warning: pyserial not available. Install with: pip install pyserial")
+
+# Signal processing imports
+try:
+    from scipy.signal import butter, lfilter, iirnotch
+    from scipy import signal as sp_signal
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("Warning: scipy not available. Install with: pip install scipy")
+
+# LSL imports
+try:
+    from pylsl import StreamInfo, StreamOutlet, local_clock
+    LSL_AVAILABLE = True
+except ImportError:
+    LSL_AVAILABLE = False
+    print("Warning: pylsl not available. Install with: pip install pylsl")
+
+# BrainFlow imports
+try:
+    from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
+    BRAINFLOW_AVAILABLE = True
+except ImportError:
+    BRAINFLOW_AVAILABLE = False
+    print("Warning: BrainFlow not available. Install with: pip install brainflow")
 
 # Import your data loading functions
 from conversions import get_gdf_array, get_pkl_array
 
-class WindowSettingsDialog(QDialog):
-    """Dialog for configuring window display settings"""
-    def __init__(self, current_mode, parent=None):
+
+def find_headset_port():
+    """
+    Automatically search for headset on typical COM ports (COM3, COM4) and others.
+    Returns the port name if found, None otherwise.
+    """
+    if not SERIAL_AVAILABLE:
+        print("Warning: pyserial not available for port scanning")
+        return None
+
+    system = platform.system()
+    ports = list(serial.tools.list_ports.comports())
+    print(f"Scanning available ports: {[p.device for p in ports]}")
+
+    # Priority ports for Windows
+    priority_ports = ['COM3', 'COM4']
+
+    # Check priority ports first
+    for port_name in priority_ports:
+        for port in ports:
+            if port.device == port_name:
+                if 'CH340' in port.description or 'USB' in port.description or 'Serial' in port.description:
+                    print(f"Found headset on priority port: {port.device}")
+                    return port.device
+
+    # Check all other ports
+    for port in ports:
+        if port.device not in priority_ports:
+            if 'CH340' in port.description or 'USB' in port.description:
+                print(f"Found potential headset: {port.device}")
+                if system == "Darwin":  # macOS
+                    if any(identifier in port.device.lower() for identifier in ["usbserial", "cu.usbmodem", "tty.usbserial"]):
+                        return port.device
+                elif system == "Windows":
+                    if "com" in port.device.lower():
+                        return port.device
+                elif system == "Linux":
+                    if "ttyUSB" in port.device or "ttyACM" in port.device:
+                        return port.device
+
+    print("No headset detected on any port.")
+    return None
+
+
+class SettingsDialog(QDialog):
+    """Dialog for configuring application settings"""
+    def __init__(self, current_mode, current_theme, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Window Settings")
-        
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(400)
+
         layout = QVBoxLayout()
-        
+
         # Display mode selection
-        mode_label = QLabel("Display Mode:")
-        layout.addWidget(mode_label)
-        
-        self.mode_group = QButtonGroup()
-        
+        mode_group = QGroupBox("Display Mode")
+        mode_layout = QVBoxLayout()
+
+        self.mode_button_group = QButtonGroup()
+
         self.overlay_radio = QRadioButton("Overlay - All channels in same plot")
         self.stacked_radio = QRadioButton("Stacked - Separate subplot per channel")
-        
-        self.mode_group.addButton(self.overlay_radio)
-        self.mode_group.addButton(self.stacked_radio)
-        
+
+        self.mode_button_group.addButton(self.overlay_radio)
+        self.mode_button_group.addButton(self.stacked_radio)
+
         if current_mode == 'overlay':
             self.overlay_radio.setChecked(True)
         else:
             self.stacked_radio.setChecked(True)
-        
-        layout.addWidget(self.overlay_radio)
-        layout.addWidget(self.stacked_radio)
-        
+
+        mode_layout.addWidget(self.overlay_radio)
+        mode_layout.addWidget(self.stacked_radio)
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
+
+        # Theme selection
+        theme_group = QGroupBox("Theme")
+        theme_layout = QVBoxLayout()
+
+        self.theme_button_group = QButtonGroup()
+
+        self.light_theme_radio = QRadioButton("Light Mode")
+        self.dark_theme_radio = QRadioButton("Dark Mode")
+
+        self.theme_button_group.addButton(self.light_theme_radio)
+        self.theme_button_group.addButton(self.dark_theme_radio)
+
+        if current_theme == 'light':
+            self.light_theme_radio.setChecked(True)
+        else:
+            self.dark_theme_radio.setChecked(True)
+
+        theme_layout.addWidget(self.light_theme_radio)
+        theme_layout.addWidget(self.dark_theme_radio)
+        theme_group.setLayout(theme_layout)
+        layout.addWidget(theme_group)
+
         # Dialog buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        
+
         self.setLayout(layout)
-    
+
     def get_mode(self):
         """Return selected display mode"""
         return 'overlay' if self.overlay_radio.isChecked() else 'stacked'
+
+    def get_theme(self):
+        """Return selected theme"""
+        return 'light' if self.light_theme_radio.isChecked() else 'dark'
 
 
 class SegmentViewer(QMainWindow):
@@ -67,7 +177,8 @@ class SegmentViewer(QMainWindow):
         self.display_mode = 'overlay'  # 'overlay' or 'stacked'
         self.file_loaded = False
         self.current_filename = ""
-        
+        self.theme = 'dark'  # 'light' or 'dark'
+
         # Initialize with no segmentation
         self.segmented = None
         self.num_windows = 0
@@ -76,52 +187,240 @@ class SegmentViewer(QMainWindow):
         self.current_window = 0
         self.active_channels = set()
         self.last_stacked_channels = set()  # Track which channels are in stacked layout
-        
+
         # Track last processed horizontal zoom value to avoid expensive updates
         self.last_horizontal_zoom_value = None
-        
+
         # Vertical bounds mode: 'iqr' or 'minmax'
         self.vertical_bounds_mode = 'iqr'
-        
+
         # Vertical zoom factor for stacked mode (amplitude scaling)
         self.stacked_vertical_zoom = 1.0
-        
+
         # Autoplay state
         self.autoplay_active = False
         self.autoplay_speed = 1.0  # 1x = real-time
         self.autoplay_timer = QTimer()
         self.autoplay_timer.timeout.connect(self.autoplay_step)
         self.autoplay_current_time = 0.0  # Current time position in seconds
+
+        # Streaming mode variables
+        self.mode = 'file'  # 'file' or 'stream'
+        self.streaming_active = False
+        self.board = None
+        self.board_id = None
+        self.eeg_channels = None
+        self.eeg_outlet = None
+        self.marker_outlet = None
+        self.stream_timer = QTimer()
+        self.stream_timer.timeout.connect(self.update_stream_data)
+        self.stream_buffer = None
+        self.stream_time_axis = None
+        self.stream_start_time = 0
+        self.patient_id = ""
+        self.trial_number = 1
+
+        # Signal processing parameters
+        self.lowcut = 5.0
+        self.highcut = 35.0
+        self.notch_freq = 60.0
+        self.magnitude_scale = 100  # microvolts
+        self.smoothing_enabled = False
+        self.smoothing_window = 5  # samples
+
+        # FFT and band power tracking
+        self.fft_data = {}
+        self.band_power_data = {
+            'delta': {},  # 0.5-4 Hz
+            'theta': {},  # 4-8 Hz
+            'alpha': {},  # 8-13 Hz
+            'beta': {},   # 13-30 Hz
+            'gamma': {}   # 30-50 Hz
+        }
+
+        # Smoothing for FFT and band power
+        self.fft_smoothing_alpha = 0.08  # EMA smoothing factor (0-1, lower = more smooth)
+        self.band_power_smoothing_alpha = 0.05
+        self.smoothed_fft = {}  # Stores smoothed FFT for each channel
+        self.smoothed_band_power = {}  # Stores smoothed band power
         
-        self.setWindowTitle("Segment Viewer - No File Loaded")
-        self.setGeometry(100, 100, 1200, 800)
-        
+        self.setWindowTitle("EEG Viewer - No File Loaded")
+        self.setGeometry(100, 100, 1600, 900)
+
         # Main widget and layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        self.main_layout = QVBoxLayout(main_widget)
-        
+        main_layout_container = QHBoxLayout(main_widget)
+
+        # Left panel for controls
+        left_panel = QWidget()
+        left_panel.setMaximumWidth(350)
+        left_panel_layout = QVBoxLayout(left_panel)
+
+        # Mode selection
+        mode_group = QGroupBox("Mode Selection")
+        mode_layout = QVBoxLayout()
+        self.file_mode_radio = QRadioButton("File Mode")
+        self.stream_mode_radio = QRadioButton("Streaming Mode")
+        self.file_mode_radio.setChecked(True)
+        self.file_mode_radio.toggled.connect(self.on_mode_changed)
+        mode_layout.addWidget(self.file_mode_radio)
+        mode_layout.addWidget(self.stream_mode_radio)
+        mode_group.setLayout(mode_layout)
+        left_panel_layout.addWidget(mode_group)
+
         # File loading section
-        file_layout = QHBoxLayout()
-        load_file_btn = QPushButton("📁 Load File")
+        self.file_group = QGroupBox("File Loading")
+        file_layout = QVBoxLayout()
+        load_file_btn = QPushButton("Load File")
         load_file_btn.clicked.connect(self.load_file)
         file_layout.addWidget(load_file_btn)
-        
+
         self.file_label = QLabel("No file loaded")
         self.file_label.setStyleSheet("color: gray; font-style: italic;")
         file_layout.addWidget(self.file_label)
-        file_layout.addStretch()
+        self.file_group.setLayout(file_layout)
+        left_panel_layout.addWidget(self.file_group)
+
+        # Streaming controls section
+        self.stream_group = QGroupBox("Streaming Controls")
+        stream_layout = QVBoxLayout()
+
+        # Auto-connect button
+        self.connect_btn = QPushButton("Auto-Connect Headset")
+        self.connect_btn.clicked.connect(self.auto_connect_headset)
+        stream_layout.addWidget(self.connect_btn)
+
+        self.connection_status = QLabel("Not connected")
+        self.connection_status.setStyleSheet("color: red;")
+        stream_layout.addWidget(self.connection_status)
+
+        # Patient ID and Trial number
+        patient_layout = QHBoxLayout()
+        patient_layout.addWidget(QLabel("Patient ID:"))
+        self.patient_id_input = QLineEdit()
+        self.patient_id_input.setPlaceholderText("e.g., P001")
+        patient_layout.addWidget(self.patient_id_input)
+        stream_layout.addLayout(patient_layout)
+
+        trial_layout = QHBoxLayout()
+        trial_layout.addWidget(QLabel("Trial:"))
+        self.trial_spinbox = QSpinBox()
+        self.trial_spinbox.setRange(1, 9999)
+        self.trial_spinbox.setValue(1)
+        trial_layout.addWidget(self.trial_spinbox)
+        stream_layout.addLayout(trial_layout)
+
+        # LSL Stream controls
+        stream_layout.addWidget(QLabel("LSL Streams:"))
+        self.start_eeg_stream_btn = QPushButton("Start EEG Stream")
+        self.start_eeg_stream_btn.clicked.connect(self.start_eeg_stream)
+        self.start_eeg_stream_btn.setEnabled(False)
+        stream_layout.addWidget(self.start_eeg_stream_btn)
+
+        self.start_marker_stream_btn = QPushButton("Start Marker Stream")
+        self.start_marker_stream_btn.clicked.connect(self.start_marker_stream)
+        self.start_marker_stream_btn.setEnabled(False)
+        stream_layout.addWidget(self.start_marker_stream_btn)
+
+        self.eeg_stream_status = QLabel("EEG Stream: Inactive")
+        self.eeg_stream_status.setStyleSheet("color: gray;")
+        stream_layout.addWidget(self.eeg_stream_status)
+
+        self.marker_stream_status = QLabel("Marker Stream: Inactive")
+        self.marker_stream_status.setStyleSheet("color: gray;")
+        stream_layout.addWidget(self.marker_stream_status)
+
+        # Start/Stop visualization
+        self.start_viz_btn = QPushButton("Start Visualization")
+        self.start_viz_btn.clicked.connect(self.toggle_streaming_visualization)
+        self.start_viz_btn.setEnabled(False)
+        stream_layout.addWidget(self.start_viz_btn)
+
+        # Motor imagery task button (placeholder)
+        self.motor_imagery_btn = QPushButton("Motor Imagery Task")
+        self.motor_imagery_btn.clicked.connect(self.motor_imagery_task_placeholder)
+        self.motor_imagery_btn.setEnabled(False)
+        self.motor_imagery_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        stream_layout.addWidget(self.motor_imagery_btn)
+
+        self.stream_group.setLayout(stream_layout)
+        self.stream_group.setEnabled(False)
+        left_panel_layout.addWidget(self.stream_group)
+
+        # Signal processing controls
+        self.signal_group = QGroupBox("Signal Processing")
+        signal_layout = QVBoxLayout()
+
+        # Magnitude scaling
+        mag_layout = QHBoxLayout()
+        mag_layout.addWidget(QLabel("Magnitude (µV):"))
+        self.magnitude_combo = QComboBox()
+        self.magnitude_combo.addItems(['5', '10', '15', '25', '50', '100', '200'])
+        self.magnitude_combo.setCurrentText('100')
+        self.magnitude_combo.currentTextChanged.connect(self.on_magnitude_changed)
+        mag_layout.addWidget(self.magnitude_combo)
+        signal_layout.addLayout(mag_layout)
+
+        # Smoothing
+        self.smoothing_checkbox = QCheckBox("Enable Smoothing")
+        self.smoothing_checkbox.stateChanged.connect(self.on_smoothing_changed)
+        signal_layout.addWidget(self.smoothing_checkbox)
+
+        smooth_window_layout = QHBoxLayout()
+        smooth_window_layout.addWidget(QLabel("Smooth Window:"))
+        self.smooth_window_spinbox = QSpinBox()
+        self.smooth_window_spinbox.setRange(3, 20)
+        self.smooth_window_spinbox.setValue(5)
+        self.smooth_window_spinbox.valueChanged.connect(self.on_smooth_window_changed)
+        smooth_window_layout.addWidget(self.smooth_window_spinbox)
+        signal_layout.addLayout(smooth_window_layout)
+
+        self.signal_group.setLayout(signal_layout)
+        self.signal_group.setEnabled(False)
+        left_panel_layout.addWidget(self.signal_group)
+
+        left_panel_layout.addStretch()
+        main_layout_container.addWidget(left_panel)
+
+        # Right side: Main content area
+        right_panel = QWidget()
+        self.main_layout = QVBoxLayout(right_panel)
+        main_layout_container.addWidget(right_panel, stretch=1)
         
-        self.main_layout.addLayout(file_layout)
-        
-        # Channel checkboxes (initially disabled but visible)
-        self.channel_group = QGroupBox("Channels")
+        # Channel selection dropdown (initially disabled but visible)
+        self.channel_group = QGroupBox("Channel Selection")
         channel_layout = QHBoxLayout()
+
+        # "Select All" checkbox
+        self.select_all_checkbox = QCheckBox("Select All")
+        self.select_all_checkbox.stateChanged.connect(self.toggle_all_channels)
+        channel_layout.addWidget(self.select_all_checkbox)
+
+        # Channel dropdown button
+        self.channel_dropdown_btn = QPushButton("Select Channels")
+        self.channel_dropdown_menu = QMenu(self)
+        self.channel_dropdown_btn.setMenu(self.channel_dropdown_menu)
+        channel_layout.addWidget(self.channel_dropdown_btn)
+
+        # Label showing selected channels
+        self.selected_channels_label = QLabel("No channels selected")
+        channel_layout.addWidget(self.selected_channels_label)
+        channel_layout.addStretch()
+
         self.channel_checkboxes = []
         self.channel_group.setLayout(channel_layout)
         self.channel_group.setEnabled(False)  # Disabled until file loaded
         self.main_layout.addWidget(self.channel_group)
-        
+
+        # Create tabs for different visualizations
+        self.viz_tabs = QTabWidget()
+
+        # Main EEG plot tab
+        main_plot_tab = QWidget()
+        main_plot_layout = QVBoxLayout(main_plot_tab)
+        main_plot_layout.setContentsMargins(0, 0, 0, 0)
+
         # Create a container for plot area with zoom sliders
         plot_and_zoom_widget = QWidget()
         plot_and_zoom_layout = QHBoxLayout(plot_and_zoom_widget)
@@ -235,8 +534,33 @@ class SegmentViewer(QMainWindow):
         plot_column_layout.addWidget(horizontal_zoom_widget)
         
         plot_and_zoom_layout.addWidget(plot_column_widget, stretch=1)
-        
-        self.main_layout.addWidget(plot_and_zoom_widget, stretch=1)
+
+        main_plot_layout.addWidget(plot_and_zoom_widget, stretch=1)
+        self.viz_tabs.addTab(main_plot_tab, "EEG Data")
+
+        # FFT tab
+        fft_tab = QWidget()
+        fft_layout = QVBoxLayout(fft_tab)
+        self.fft_plot_widget = pg.PlotWidget()
+        self.fft_plot_widget.setLabel('bottom', 'Frequency (Hz)')
+        self.fft_plot_widget.setLabel('left', 'Power (dB)')
+        self.fft_plot_widget.setTitle('Real-time FFT')
+        self.fft_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        fft_layout.addWidget(self.fft_plot_widget)
+        self.viz_tabs.addTab(fft_tab, "FFT")
+
+        # Band Power tab
+        band_power_tab = QWidget()
+        band_power_layout = QVBoxLayout(band_power_tab)
+        self.band_power_plot_widget = pg.PlotWidget()
+        self.band_power_plot_widget.setLabel('bottom', 'Frequency Band')
+        self.band_power_plot_widget.setLabel('left', 'Power')
+        self.band_power_plot_widget.setTitle('Real-time Band Power')
+        self.band_power_plot_widget.showGrid(x=False, y=True, alpha=0.3)
+        band_power_layout.addWidget(self.band_power_plot_widget)
+        self.viz_tabs.addTab(band_power_tab, "Band Power")
+
+        self.main_layout.addWidget(self.viz_tabs, stretch=1)
         
         # Autoplay playback controls (hidden by default)
         self.playback_controls_widget = QWidget()
@@ -314,13 +638,20 @@ class SegmentViewer(QMainWindow):
         nav_layout.addWidget(self.autofit_btn)
         
         # Window settings button
-        self.window_settings_btn = QPushButton("👁️ Window Settings")
-        self.window_settings_btn.clicked.connect(self.open_window_settings_dialog)
-        nav_layout.addWidget(self.window_settings_btn)
+        self.settings_btn = QPushButton("⚙️ Settings")
+        self.settings_btn.clicked.connect(self.open_settings_dialog)
+        nav_layout.addWidget(self.settings_btn)
         
         self.nav_widget.setEnabled(False)  # Disabled until file loaded
         self.main_layout.addWidget(self.nav_widget)
-    
+
+        # Apply initial theme
+        self.apply_theme()
+
+        # Set aspect ratio constraints to preserve display ratio
+        self.setMinimumSize(QSize(1200, 675))  # 16:9 ratio
+        self.resize(1600, 900)  # Default 16:9 size
+
     def load_file(self):
         """Open file dialog to load .gdf or .pkl file"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -372,22 +703,21 @@ class SegmentViewer(QMainWindow):
             else:
                 self.setup_stacked_mode()
             
-            # Setup channel checkboxes
-            channel_layout = self.channel_group.layout()
-            # Clear existing checkboxes
-            while channel_layout.count():
-                child = channel_layout.takeAt(0)
-                if child.widget():
-                    child.widget().deleteLater()
-            
+            # Setup channel checkboxes in dropdown
+            self.channel_dropdown_menu.clear()
             self.channel_checkboxes = []
             self.active_channels.clear()  # Reset active channels
+
             for i in range(self.num_channels):
                 cb = QCheckBox(f"Ch{i+1}")
                 cb.stateChanged.connect(lambda state, ch=i: self.toggle_channel(ch, state))
-                channel_layout.addWidget(cb)
                 self.channel_checkboxes.append(cb)
-            
+
+                # Add checkbox to menu
+                action = QWidgetAction(self.channel_dropdown_menu)
+                action.setDefaultWidget(cb)
+                self.channel_dropdown_menu.addAction(action)
+
             # Enable channel group
             self.channel_group.setEnabled(True)
             
@@ -985,13 +1315,30 @@ class SegmentViewer(QMainWindow):
     
     def toggle_channel(self, channel_idx, state):
         """Toggle channel visibility"""
-        if not self.file_loaded:
+        if not self.file_loaded and not self.streaming_active:
             return
         if state == Qt.Checked:
             self.active_channels.add(channel_idx)
         else:
             self.active_channels.discard(channel_idx)
+
+        # Update "Select All" checkbox state
+        self.select_all_checkbox.blockSignals(True)
+        if len(self.active_channels) == self.num_channels:
+            self.select_all_checkbox.setChecked(True)
+        elif len(self.active_channels) == 0:
+            self.select_all_checkbox.setChecked(False)
+        else:
+            self.select_all_checkbox.setCheckState(Qt.PartiallyChecked)
+        self.select_all_checkbox.blockSignals(False)
+
+        self.update_selected_channels_label()
         self.update_plot()
+
+        # Update FFT and band power for file mode
+        if self.file_loaded and not self.streaming_active:
+            self.calculate_fft_for_file()
+            self.calculate_band_power_for_file()
     
     def update_plot(self, rebuild=True):
         """Redraw plot with active channels and IQR-based bounds
@@ -1513,6 +1860,11 @@ class SegmentViewer(QMainWindow):
         
         # Update plot data and apply zoom
         self.update_plot()
+
+        # Update FFT and band power for file mode
+        if self.file_loaded and not self.streaming_active:
+            self.calculate_fft_for_file()
+            self.calculate_band_power_for_file()
     
     def on_slider_changed(self, value):
         """Handle slider movement"""
@@ -1699,36 +2051,818 @@ class SegmentViewer(QMainWindow):
         # Update window controls to reflect current position
         self.update_window_controls_from_view()
     
-    def open_window_settings_dialog(self):
-        """Open dialog to configure window display settings"""
-        dialog = WindowSettingsDialog(self.display_mode, self)
+    def open_settings_dialog(self):
+        """Open dialog to configure application settings"""
+        dialog = SettingsDialog(self.display_mode, self.theme, self)
         if dialog.exec_() == QDialog.Accepted:
             new_mode = dialog.get_mode()
+            new_theme = dialog.get_theme()
+
+            # Handle theme change
+            if new_theme != self.theme:
+                self.theme = new_theme
+                self.apply_theme()
+
+            # Handle display mode change
             if new_mode != self.display_mode:
                 self.display_mode = new_mode
-                
+
                 # Rebuild plot layout
                 if self.display_mode == 'overlay':
                     self.setup_overlay_mode()
                 else:
                     self.setup_stacked_mode()
-                
+
                 # Refresh plot (will automatically apply zoom)
                 self.update_plot()
-                
+
                 print(f"Display mode changed to: {self.display_mode}")
     
+    def on_mode_changed(self):
+        """Handle mode switching between file and streaming"""
+        if self.file_mode_radio.isChecked():
+            self.mode = 'file'
+            self.file_group.setEnabled(True)
+            self.stream_group.setEnabled(False)
+            self.signal_group.setEnabled(False)
+        else:
+            self.mode = 'stream'
+            self.file_group.setEnabled(False)
+            self.stream_group.setEnabled(True)
+            self.signal_group.setEnabled(True)
+
+    def auto_connect_headset(self):
+        """Auto-detect and connect to EEG headset"""
+        if not BRAINFLOW_AVAILABLE:
+            QMessageBox.critical(self, "Error", "BrainFlow is not installed.\nInstall with: pip install brainflow")
+            return
+
+        if not SERIAL_AVAILABLE:
+            QMessageBox.critical(self, "Error", "pyserial is not installed.\nInstall with: pip install pyserial")
+            return
+
+        self.connect_btn.setEnabled(False)
+        self.connect_btn.setText("Connecting...")
+
+        try:
+            # Find serial port
+            serial_port = find_headset_port()
+
+            if serial_port is None:
+                response = QMessageBox.question(
+                    self,
+                    "No Headset Found",
+                    "No headset detected. Use synthetic board for testing?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if response == QMessageBox.Yes:
+                    self.board_id = BoardIds.SYNTHETIC_BOARD.value
+                    params = BrainFlowInputParams()
+                else:
+                    self.connect_btn.setEnabled(True)
+                    self.connect_btn.setText("Auto-Connect Headset")
+                    return
+            else:
+                self.board_id = BoardIds.CYTON_BOARD.value
+                params = BrainFlowInputParams()
+                params.serial_port = serial_port
+
+            # Initialize board
+            BoardShim.enable_dev_board_logger()
+            self.board = BoardShim(self.board_id, params)
+            self.board.prepare_session()
+            self.board.start_stream()
+
+            # Get channel info
+            self.eeg_channels = BoardShim.get_eeg_channels(self.board_id)
+            self.num_channels = len(self.eeg_channels)
+            self.sampling_rate = BoardShim.get_sampling_rate(self.board_id)
+
+            # Initialize buffer for streaming (5 seconds)
+            buffer_size = int(self.sampling_rate * 5)
+            self.stream_buffer = np.zeros((self.num_channels, buffer_size))
+            self.stream_time_axis = np.arange(buffer_size) / self.sampling_rate
+
+            # Update UI
+            self.connection_status.setText(f"Connected: {self.num_channels} channels @ {self.sampling_rate} Hz")
+            self.connection_status.setStyleSheet("color: green;")
+            self.connect_btn.setText("Disconnect")
+            self.connect_btn.clicked.disconnect()
+            self.connect_btn.clicked.connect(self.disconnect_headset)
+            self.connect_btn.setEnabled(True)
+
+            # Enable stream controls
+            self.start_eeg_stream_btn.setEnabled(True)
+            self.start_marker_stream_btn.setEnabled(True)
+            self.start_viz_btn.setEnabled(True)
+            self.motor_imagery_btn.setEnabled(True)
+
+            # Setup channel checkboxes for streaming
+            self.setup_streaming_channels()
+
+            QMessageBox.information(self, "Success", f"Connected to headset!\n{self.num_channels} channels @ {self.sampling_rate} Hz")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Connection Error", f"Failed to connect to headset:\n{str(e)}")
+            self.connect_btn.setEnabled(True)
+            self.connect_btn.setText("Auto-Connect Headset")
+
+    def disconnect_headset(self):
+        """Disconnect from headset"""
+        try:
+            if self.streaming_active:
+                self.toggle_streaming_visualization()
+
+            if self.board is not None:
+                self.board.stop_stream()
+                self.board.release_session()
+                self.board = None
+
+            if self.eeg_outlet is not None:
+                del self.eeg_outlet
+                self.eeg_outlet = None
+
+            if self.marker_outlet is not None:
+                del self.marker_outlet
+                self.marker_outlet = None
+
+            self.connection_status.setText("Not connected")
+            self.connection_status.setStyleSheet("color: red;")
+            self.connect_btn.setText("Auto-Connect Headset")
+            self.connect_btn.clicked.disconnect()
+            self.connect_btn.clicked.connect(self.auto_connect_headset)
+
+            self.start_eeg_stream_btn.setEnabled(False)
+            self.start_marker_stream_btn.setEnabled(False)
+            self.start_viz_btn.setEnabled(False)
+            self.motor_imagery_btn.setEnabled(False)
+
+            self.eeg_stream_status.setText("EEG Stream: Inactive")
+            self.eeg_stream_status.setStyleSheet("color: gray;")
+            self.marker_stream_status.setText("Marker Stream: Inactive")
+            self.marker_stream_status.setStyleSheet("color: gray;")
+
+        except Exception as e:
+            QMessageBox.warning(self, "Warning", f"Error during disconnect:\n{str(e)}")
+
+    def setup_streaming_channels(self):
+        """Setup channel checkboxes for streaming mode"""
+        self.channel_dropdown_menu.clear()
+        self.channel_checkboxes = []
+        self.active_channels.clear()
+
+        for i in range(self.num_channels):
+            cb = QCheckBox(f"Ch{i+1}")
+            cb.stateChanged.connect(lambda state, ch=i: self.toggle_channel(ch, state))
+            self.channel_checkboxes.append(cb)
+
+            # Add checkbox to menu
+            action = QWidgetAction(self.channel_dropdown_menu)
+            action.setDefaultWidget(cb)
+            self.channel_dropdown_menu.addAction(action)
+
+        # Enable channel group
+        self.channel_group.setEnabled(True)
+
+        # Select all channels by default
+        self.select_all_checkbox.setChecked(True)
+
+    def start_eeg_stream(self):
+        """Start LSL EEG stream"""
+        if not LSL_AVAILABLE:
+            QMessageBox.critical(self, "Error", "pylsl is not installed.\nInstall with: pip install pylsl")
+            return
+
+        if self.eeg_outlet is not None:
+            QMessageBox.information(self, "Info", "EEG stream already active")
+            return
+
+        try:
+            # Get patient ID
+            self.patient_id = self.patient_id_input.text().strip()
+            if not self.patient_id:
+                QMessageBox.warning(self, "Warning", "Please enter a Patient ID")
+                return
+
+            self.trial_number = self.trial_spinbox.value()
+
+            # Create stream name with auto-naming
+            stream_name = f"EEG_{self.patient_id}_Trial{self.trial_number:04d}"
+
+            # Create LSL stream info
+            info = StreamInfo(
+                name=stream_name,
+                type='EEG',
+                channel_count=self.num_channels,
+                nominal_srate=self.sampling_rate,
+                channel_format='float32',
+                source_id=f'eeg_headset_{self.patient_id}'
+            )
+
+            # Create outlet
+            self.eeg_outlet = StreamOutlet(info)
+
+            self.eeg_stream_status.setText(f"EEG Stream: Active - {stream_name}")
+            self.eeg_stream_status.setStyleSheet("color: green; font-weight: bold;")
+            self.start_eeg_stream_btn.setText("Stop EEG Stream")
+            self.start_eeg_stream_btn.clicked.disconnect()
+            self.start_eeg_stream_btn.clicked.connect(self.stop_eeg_stream)
+
+            print(f"LSL EEG Stream started: {stream_name}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start EEG stream:\n{str(e)}")
+
+    def stop_eeg_stream(self):
+        """Stop LSL EEG stream"""
+        if self.eeg_outlet is not None:
+            del self.eeg_outlet
+            self.eeg_outlet = None
+
+        self.eeg_stream_status.setText("EEG Stream: Inactive")
+        self.eeg_stream_status.setStyleSheet("color: gray;")
+        self.start_eeg_stream_btn.setText("Start EEG Stream")
+        self.start_eeg_stream_btn.clicked.disconnect()
+        self.start_eeg_stream_btn.clicked.connect(self.start_eeg_stream)
+
+    def start_marker_stream(self):
+        """Start LSL Marker stream"""
+        if not LSL_AVAILABLE:
+            QMessageBox.critical(self, "Error", "pylsl is not installed.\nInstall with: pip install pylsl")
+            return
+
+        if self.marker_outlet is not None:
+            QMessageBox.information(self, "Info", "Marker stream already active")
+            return
+
+        try:
+            # Get patient ID
+            self.patient_id = self.patient_id_input.text().strip()
+            if not self.patient_id:
+                QMessageBox.warning(self, "Warning", "Please enter a Patient ID")
+                return
+
+            self.trial_number = self.trial_spinbox.value()
+
+            # Create stream name with auto-naming
+            stream_name = f"Markers_{self.patient_id}_Trial{self.trial_number:04d}"
+
+            # Create LSL stream info for markers
+            info = StreamInfo(
+                name=stream_name,
+                type='Markers',
+                channel_count=1,
+                nominal_srate=0,  # Irregular rate for markers
+                channel_format='string',
+                source_id=f'markers_{self.patient_id}'
+            )
+
+            # Create outlet
+            self.marker_outlet = StreamOutlet(info)
+
+            self.marker_stream_status.setText(f"Marker Stream: Active - {stream_name}")
+            self.marker_stream_status.setStyleSheet("color: green; font-weight: bold;")
+            self.start_marker_stream_btn.setText("Stop Marker Stream")
+            self.start_marker_stream_btn.clicked.disconnect()
+            self.start_marker_stream_btn.clicked.connect(self.stop_marker_stream)
+
+            print(f"LSL Marker Stream started: {stream_name}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start marker stream:\n{str(e)}")
+
+    def stop_marker_stream(self):
+        """Stop LSL Marker stream"""
+        if self.marker_outlet is not None:
+            del self.marker_outlet
+            self.marker_outlet = None
+
+        self.marker_stream_status.setText("Marker Stream: Inactive")
+        self.marker_stream_status.setStyleSheet("color: gray;")
+        self.start_marker_stream_btn.setText("Start Marker Stream")
+        self.start_marker_stream_btn.clicked.disconnect()
+        self.start_marker_stream_btn.clicked.connect(self.start_marker_stream)
+
+    def toggle_streaming_visualization(self):
+        """Start or stop real-time visualization"""
+        if not self.streaming_active:
+            # Start streaming visualization
+            self.streaming_active = True
+            self.stream_start_time = local_clock() if LSL_AVAILABLE else 0
+            self.stream_timer.start(50)  # Update every 50ms (20 Hz)
+            self.start_viz_btn.setText("Stop Visualization")
+            self.start_viz_btn.setStyleSheet("background-color: #f44336; color: white;")
+
+            # Setup visualization
+            self.file_loaded = True
+            self.current_filename = "Live Stream"
+            self.setWindowTitle("EEG Viewer - Live Streaming")
+
+            # Setup plot based on current display mode
+            if self.display_mode == 'overlay':
+                self.setup_overlay_mode()
+            else:
+                self.setup_stacked_mode()
+
+            # Enable controls
+            self.vertical_zoom_slider.setEnabled(True)
+            self.vertical_zoom_spinbox.setEnabled(True)
+            self.bounds_mode_combo.setEnabled(True)
+
+        else:
+            # Stop streaming visualization
+            self.streaming_active = False
+            self.stream_timer.stop()
+            self.start_viz_btn.setText("Start Visualization")
+            self.start_viz_btn.setStyleSheet("")
+            self.file_loaded = False
+
+            # Clear plot
+            if hasattr(self, 'plot_widget') and self.plot_widget is not None:
+                self.plot_widget.clear()
+
+    def update_stream_data(self):
+        """Update visualization with new streaming data"""
+        if self.board is None or not self.streaming_active:
+            return
+
+        try:
+            # Get new data from board
+            data = self.board.get_board_data()
+
+            if data.shape[1] == 0:
+                return  # No new data
+
+            # Extract EEG channels
+            eeg_data = data[self.eeg_channels, :]
+
+            # Send to LSL if outlet is active
+            if self.eeg_outlet is not None and LSL_AVAILABLE:
+                for i in range(eeg_data.shape[1]):
+                    self.eeg_outlet.push_sample(eeg_data[:, i].tolist())
+
+            # Apply signal processing
+            processed_data = self.process_signal(eeg_data)
+
+            # Update buffer (shift and append)
+            new_samples = processed_data.shape[1]
+            if new_samples > 0:
+                self.stream_buffer = np.roll(self.stream_buffer, -new_samples, axis=1)
+                if new_samples >= self.stream_buffer.shape[1]:
+                    self.stream_buffer = processed_data[:, -self.stream_buffer.shape[1]:]
+                else:
+                    self.stream_buffer[:, -new_samples:] = processed_data
+
+                # Update raw_data to make it compatible with existing plotting code
+                self.raw_data = self.stream_buffer.copy()
+                self.num_samples = self.stream_buffer.shape[1]
+
+                # Update plots
+                self.update_streaming_plots()
+
+                # Calculate and update FFT
+                self.update_fft()
+
+                # Calculate and update band power
+                self.update_band_power()
+
+        except Exception as e:
+            print(f"Error updating stream: {str(e)}")
+
+    def process_signal(self, data):
+        """Apply signal processing to raw data"""
+        processed = np.zeros_like(data)
+
+        for i in range(data.shape[0]):
+            channel_data = data[i, :].copy()
+
+            # Bandpass filter (5-35 Hz)
+            if SCIPY_AVAILABLE:
+                try:
+                    b, a = butter(2, [self.lowcut, self.highcut], btype='band', fs=self.sampling_rate)
+                    channel_data = lfilter(b, a, channel_data)
+                except:
+                    pass  # Skip if not enough data
+
+            # Notch filter (60 Hz)
+            if SCIPY_AVAILABLE:
+                try:
+                    b, a = iirnotch(self.notch_freq, 30, fs=self.sampling_rate)
+                    channel_data = lfilter(b, a, channel_data)
+                except:
+                    pass
+
+            # Apply magnitude scaling
+            channel_data = channel_data * (self.magnitude_scale / 100.0)
+
+            # Apply smoothing if enabled
+            if self.smoothing_enabled and len(channel_data) >= self.smoothing_window:
+                channel_data = np.convolve(
+                    channel_data,
+                    np.ones(self.smoothing_window) / self.smoothing_window,
+                    mode='same'
+                )
+
+            processed[i, :] = channel_data
+
+        return processed
+
+    def update_streaming_plots(self):
+        """Update plot widgets with streaming data"""
+        if not self.active_channels:
+            return
+
+        # Update the main plot (use overlay mode for simplicity in streaming)
+        if hasattr(self, 'plot_widget') and self.plot_widget is not None:
+            self.plot_widget.clear()
+
+            colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
+
+            for ch_idx in sorted(self.active_channels):
+                if ch_idx < self.num_channels:
+                    data = self.stream_buffer[ch_idx, :]
+                    color = colors[ch_idx % len(colors)]
+
+                    self.plot_widget.plot(
+                        self.stream_time_axis,
+                        data,
+                        pen=pg.mkPen(color=color, width=2),
+                        name=f'Ch{ch_idx+1}'
+                    )
+
+            # Auto-range
+            self.plot_widget.enableAutoRange()
+
+    def update_fft(self):
+        """Calculate and display FFT for active channels with smoothing"""
+        if not self.active_channels or self.stream_buffer is None:
+            return
+
+        self.fft_plot_widget.clear()
+        colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
+
+        for ch_idx in sorted(self.active_channels):
+            if ch_idx < self.num_channels:
+                data = self.stream_buffer[ch_idx, :]
+
+                # Compute FFT
+                fft_vals = np.fft.rfft(data)
+                fft_freq = np.fft.rfftfreq(len(data), 1.0 / self.sampling_rate)
+
+                # Convert to power (dB)
+                fft_power = 20 * np.log10(np.abs(fft_vals) + 1e-10)
+
+                # Apply exponential moving average smoothing
+                mask = fft_freq <= 50
+                if ch_idx in self.smoothed_fft:
+                    # EMA: smoothed = alpha * new + (1 - alpha) * smoothed
+                    self.smoothed_fft[ch_idx] = (
+                        self.fft_smoothing_alpha * fft_power[mask] +
+                        (1 - self.fft_smoothing_alpha) * self.smoothed_fft[ch_idx]
+                    )
+                else:
+                    # First time, initialize with current value
+                    self.smoothed_fft[ch_idx] = fft_power[mask].copy()
+
+                # Plot smoothed FFT only up to 50 Hz
+                color = colors[ch_idx % len(colors)]
+
+                self.fft_plot_widget.plot(
+                    fft_freq[mask],
+                    self.smoothed_fft[ch_idx],
+                    pen=pg.mkPen(color=color, width=2),
+                    name=f'Ch{ch_idx+1}'
+                )
+
+                # Store for reference
+                self.fft_data[ch_idx] = (fft_freq[mask], self.smoothed_fft[ch_idx])
+
+    def update_band_power(self):
+        """Calculate and display band power for active channels"""
+        if not self.active_channels or self.stream_buffer is None:
+            return
+
+        if not SCIPY_AVAILABLE:
+            return
+
+        # Define frequency bands
+        bands = {
+            'Delta': (0.5, 4),
+            'Theta': (4, 8),
+            'Alpha': (8, 13),
+            'Beta': (13, 30),
+            'Gamma': (30, 50)
+        }
+
+        self.band_power_plot_widget.clear()
+        colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
+
+        # Average across all active channels
+        band_powers = {band: 0.0 for band in bands.keys()}
+
+        for ch_idx in sorted(self.active_channels):
+            if ch_idx < self.num_channels:
+                data = self.stream_buffer[ch_idx, :]
+
+                # Compute PSD using Welch's method
+                freqs, psd = sp_signal.welch(data, fs=self.sampling_rate, nperseg=min(256, len(data)))
+
+                # Calculate power in each band
+                for band_name, (low, high) in bands.items():
+                    band_mask = (freqs >= low) & (freqs < high)
+                    if np.any(band_mask):
+                        band_powers[band_name] += np.mean(psd[band_mask])
+
+        # Average across channels
+        num_active = len(self.active_channels)
+        if num_active > 0:
+            for band in band_powers:
+                band_powers[band] /= num_active
+
+        # Apply exponential moving average smoothing
+        if self.smoothed_band_power:
+            for band_name in band_powers.keys():
+                if band_name in self.smoothed_band_power:
+                    self.smoothed_band_power[band_name] = (
+                        self.band_power_smoothing_alpha * band_powers[band_name] +
+                        (1 - self.band_power_smoothing_alpha) * self.smoothed_band_power[band_name]
+                    )
+                else:
+                    self.smoothed_band_power[band_name] = band_powers[band_name]
+        else:
+            # First time, initialize with current values
+            self.smoothed_band_power = band_powers.copy()
+
+        # Plot smoothed band powers as bar chart
+        band_names = list(bands.keys())
+        band_values = [self.smoothed_band_power[name] for name in band_names]
+        x_pos = np.arange(len(band_names))
+
+        # Create bar graph
+        bargraph = pg.BarGraphItem(x=x_pos, height=band_values, width=0.6, brush='b')
+        self.band_power_plot_widget.addItem(bargraph)
+
+        # Set x-axis labels
+        ax = self.band_power_plot_widget.getAxis('bottom')
+        ax.setTicks([[(i, band_names[i]) for i in range(len(band_names))]])
+
+    def motor_imagery_task_placeholder(self):
+        """Placeholder for motor imagery task - to be integrated later"""
+        QMessageBox.information(
+            self,
+            "Motor Imagery Task",
+            "Motor imagery task integration point.\n\nThis will be connected to your motor imagery task implementation later."
+        )
+
+        # Send a marker if marker stream is active
+        if self.marker_outlet is not None and LSL_AVAILABLE:
+            self.marker_outlet.push_sample(['MOTOR_IMAGERY_START'])
+            print("Marker sent: MOTOR_IMAGERY_START")
+
+    def on_magnitude_changed(self, text):
+        """Handle magnitude scale change"""
+        try:
+            self.magnitude_scale = int(text)
+        except:
+            self.magnitude_scale = 100
+
+    def on_smoothing_changed(self, state):
+        """Handle smoothing checkbox change"""
+        self.smoothing_enabled = (state == Qt.Checked)
+
+    def on_smooth_window_changed(self, value):
+        """Handle smoothing window size change"""
+        self.smoothing_window = value
+
+    def toggle_all_channels(self, state):
+        """Toggle all channel checkboxes"""
+        is_checked = (state == Qt.Checked)
+        for cb in self.channel_checkboxes:
+            cb.blockSignals(True)
+            cb.setChecked(is_checked)
+            cb.blockSignals(False)
+
+        # Manually update active channels
+        if is_checked:
+            self.active_channels = set(range(self.num_channels))
+        else:
+            self.active_channels.clear()
+
+        self.update_selected_channels_label()
+        self.update_plot()
+
+    def update_selected_channels_label(self):
+        """Update the label showing selected channels"""
+        if not self.active_channels:
+            self.selected_channels_label.setText("No channels selected")
+        elif len(self.active_channels) == self.num_channels:
+            self.selected_channels_label.setText(f"All {self.num_channels} channels selected")
+        else:
+            selected_list = sorted(list(self.active_channels))
+            if len(selected_list) <= 5:
+                channels_str = ", ".join([f"Ch{i+1}" for i in selected_list])
+                self.selected_channels_label.setText(f"Selected: {channels_str}")
+            else:
+                self.selected_channels_label.setText(f"{len(selected_list)} channels selected")
+
+    def apply_theme(self):
+        """Apply the selected theme to the application"""
+        app = QApplication.instance()
+
+        if self.theme == 'dark':
+            # Sleek dark theme
+            dark_palette = QPalette()
+            dark_palette.setColor(QPalette.Window, QColor(30, 30, 30))
+            dark_palette.setColor(QPalette.WindowText, QColor(230, 230, 230))
+            dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
+            dark_palette.setColor(QPalette.AlternateBase, QColor(35, 35, 35))
+            dark_palette.setColor(QPalette.ToolTipBase, QColor(50, 50, 50))
+            dark_palette.setColor(QPalette.ToolTipText, QColor(230, 230, 230))
+            dark_palette.setColor(QPalette.Text, QColor(230, 230, 230))
+            dark_palette.setColor(QPalette.Button, QColor(45, 45, 45))
+            dark_palette.setColor(QPalette.ButtonText, QColor(230, 230, 230))
+            dark_palette.setColor(QPalette.BrightText, QColor(255, 100, 100))
+            dark_palette.setColor(QPalette.Link, QColor(80, 160, 255))
+            dark_palette.setColor(QPalette.Highlight, QColor(70, 130, 220))
+            dark_palette.setColor(QPalette.HighlightedText, Qt.white)
+            dark_palette.setColor(QPalette.Disabled, QPalette.Text, QColor(100, 100, 100))
+            dark_palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(100, 100, 100))
+            app.setPalette(dark_palette)
+
+            # Sleek dark plots
+            pg.setConfigOption('background', (20, 20, 20))
+            pg.setConfigOption('foreground', (230, 230, 230))
+
+            # Sleek stylesheet
+            app.setStyleSheet("""
+                QGroupBox { border: 1px solid #3a3a3a; border-radius: 5px; margin-top: 10px; padding-top: 10px; font-weight: bold; }
+                QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 5px; color: #e6e6e6; }
+                QPushButton { background-color: #3d3d3d; border: 1px solid #555; border-radius: 4px; padding: 5px 10px; color: #e6e6e6; }
+                QPushButton:hover { background-color: #4a4a4a; border: 1px solid #6a6a6a; }
+                QPushButton:pressed { background-color: #2a2a2a; }
+                QPushButton:disabled { background-color: #2a2a2a; color: #646464; }
+                QComboBox { background-color: #3d3d3d; border: 1px solid #555; border-radius: 4px; padding: 3px 10px; color: #e6e6e6; }
+                QComboBox:hover { border: 1px solid #6a6a6a; }
+                QSpinBox, QDoubleSpinBox, QLineEdit { background-color: #3d3d3d; border: 1px solid #555; border-radius: 4px; padding: 3px; color: #e6e6e6; }
+                QSlider::groove:horizontal { background: #3a3a3a; height: 6px; border-radius: 3px; }
+                QSlider::handle:horizontal { background: #4686d6; width: 14px; margin: -4px 0; border-radius: 7px; }
+                QSlider::groove:vertical { background: #3a3a3a; width: 6px; border-radius: 3px; }
+                QSlider::handle:vertical { background: #4686d6; height: 14px; margin: 0 -4px; border-radius: 7px; }
+                QTabWidget::pane { border: 1px solid #3a3a3a; background: #1e1e1e; }
+                QTabBar::tab { background: #2d2d2d; border: 1px solid #3a3a3a; padding: 8px 16px; color: #e6e6e6; }
+                QTabBar::tab:selected { background: #3d3d3d; border-bottom-color: #3d3d3d; }
+                QTabBar::tab:hover { background: #3a3a3a; }
+            """)
+
+        else:
+            # Light theme
+            app.setPalette(QApplication.style().standardPalette())
+            pg.setConfigOption('background', 'w')
+            pg.setConfigOption('foreground', 'k')
+
+            app.setStyleSheet("""
+                QGroupBox { border: 1px solid #c0c0c0; border-radius: 5px; margin-top: 10px; padding-top: 10px; font-weight: bold; }
+                QPushButton { border: 1px solid #b0b0b0; border-radius: 4px; padding: 5px 10px; background-color: #f0f0f0; }
+                QPushButton:hover { background-color: #e0e0e0; border: 1px solid #909090; }
+                QPushButton:pressed { background-color: #d0d0d0; }
+                QTabBar::tab { padding: 8px 16px; }
+            """)
+
+        # Refresh plots
+        if self.file_loaded or self.streaming_active:
+            self.update_plot()
+
+    def calculate_fft_for_file(self):
+        """Calculate and display FFT for file mode with smoothing"""
+        if not self.active_channels or self.raw_data is None:
+            return
+
+        if not SCIPY_AVAILABLE:
+            return
+
+        self.fft_plot_widget.clear()
+        colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
+
+        # Get current window data
+        start_sample, end_sample = self.get_window_bounds(self.current_window)
+
+        for ch_idx in sorted(self.active_channels):
+            if ch_idx < self.num_channels:
+                data = self.raw_data[ch_idx, start_sample:end_sample]
+
+                # Compute FFT
+                fft_vals = np.fft.rfft(data)
+                fft_freq = np.fft.rfftfreq(len(data), 1.0 / self.sampling_rate)
+
+                # Convert to power (dB)
+                fft_power = 20 * np.log10(np.abs(fft_vals) + 1e-10)
+
+                # Apply exponential moving average smoothing
+                if ch_idx in self.smoothed_fft:
+                    # EMA: smoothed = alpha * new + (1 - alpha) * smoothed
+                    mask = fft_freq <= 50
+                    self.smoothed_fft[ch_idx] = (
+                        self.fft_smoothing_alpha * fft_power[mask] +
+                        (1 - self.fft_smoothing_alpha) * self.smoothed_fft[ch_idx]
+                    )
+                else:
+                    # First time, initialize with current value
+                    mask = fft_freq <= 50
+                    self.smoothed_fft[ch_idx] = fft_power[mask].copy()
+
+                # Plot smoothed FFT only up to 50 Hz
+                mask = fft_freq <= 50
+                color = colors[ch_idx % len(colors)]
+
+                self.fft_plot_widget.plot(
+                    fft_freq[mask],
+                    self.smoothed_fft[ch_idx],
+                    pen=pg.mkPen(color=color, width=2),
+                    name=f'Ch{ch_idx+1}'
+                )
+
+    def calculate_band_power_for_file(self):
+        """Calculate and display band power for file mode with smoothing"""
+        if not self.active_channels or self.raw_data is None:
+            return
+
+        if not SCIPY_AVAILABLE:
+            return
+
+        # Define frequency bands
+        bands = {
+            'Delta': (0.5, 4),
+            'Theta': (4, 8),
+            'Alpha': (8, 13),
+            'Beta': (13, 30),
+            'Gamma': (30, 50)
+        }
+
+        self.band_power_plot_widget.clear()
+
+        # Get current window data
+        start_sample, end_sample = self.get_window_bounds(self.current_window)
+
+        # Average across all active channels
+        band_powers = {band: 0.0 for band in bands.keys()}
+
+        for ch_idx in sorted(self.active_channels):
+            if ch_idx < self.num_channels:
+                data = self.raw_data[ch_idx, start_sample:end_sample]
+
+                # Compute PSD using Welch's method
+                freqs, psd = sp_signal.welch(data, fs=self.sampling_rate, nperseg=min(256, len(data)))
+
+                # Calculate power in each band
+                for band_name, (low, high) in bands.items():
+                    band_mask = (freqs >= low) & (freqs < high)
+                    if np.any(band_mask):
+                        band_powers[band_name] += np.mean(psd[band_mask])
+
+        # Average across channels
+        num_active = len(self.active_channels)
+        if num_active > 0:
+            for band in band_powers:
+                band_powers[band] /= num_active
+
+        # Apply exponential moving average smoothing
+        if self.smoothed_band_power:
+            for band_name in band_powers.keys():
+                if band_name in self.smoothed_band_power:
+                    self.smoothed_band_power[band_name] = (
+                        self.band_power_smoothing_alpha * band_powers[band_name] +
+                        (1 - self.band_power_smoothing_alpha) * self.smoothed_band_power[band_name]
+                    )
+                else:
+                    self.smoothed_band_power[band_name] = band_powers[band_name]
+        else:
+            # First time, initialize with current values
+            self.smoothed_band_power = band_powers.copy()
+
+        # Plot smoothed band powers
+        band_names = list(bands.keys())
+        band_values = [self.smoothed_band_power[name] for name in band_names]
+        x_pos = np.arange(len(band_names))
+
+        # Create bar graph
+        bargraph = pg.BarGraphItem(x=x_pos, height=band_values, width=0.6, brush='b')
+        self.band_power_plot_widget.addItem(bargraph)
+
+        # Set x-axis labels
+        ax = self.band_power_plot_widget.getAxis('bottom')
+        ax.setTicks([[(i, band_names[i]) for i in range(len(band_names))]])
+
     def keyPressEvent(self, event):
         """Handle keyboard shortcuts"""
         from PyQt5.QtCore import Qt
-        
+
         # Spacebar toggles play/pause when in autoplay mode
         if event.key() == Qt.Key_Space:
             if self.autoplay_active:
                 self.toggle_play_pause()
                 event.accept()
                 return
-        
+
         # Let the parent class handle other keys
         super().keyPressEvent(event)
 

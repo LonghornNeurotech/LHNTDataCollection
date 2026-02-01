@@ -1,0 +1,19 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python-envs.pythonProjects": [],
+
+    "python.env": {
+        "PYTHONDONTWRITEBYTECODE": "1"
+    },
+
+    "terminal.integrated.env.windows": {
+        "PYTHONDONTWRITEBYTECODE": "1"
+    },
+    "terminal.integrated.env.linux": {
+        "PYTHONDONTWRITEBYTECODE": "1"
+    },
+    "terminal.integrated.env.osx": {
+        "PYTHONDONTWRITEBYTECODE": "1"
+    }
+}
