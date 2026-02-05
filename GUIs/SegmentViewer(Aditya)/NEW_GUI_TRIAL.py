@@ -17,6 +17,7 @@ from PyQt5.QtGui import QPalette, QColor
 import platform
 from datetime import datetime
 import os
+from pylsl import StreamInfo, StreamOutlet, local_clock
 
 # Serial port imports
 try:
@@ -37,7 +38,6 @@ except ImportError:
 
 # LSL imports
 try:
-    from pylsl import StreamInfo, StreamOutlet, local_clock
     LSL_AVAILABLE = True
 except ImportError:
     LSL_AVAILABLE = False
@@ -207,6 +207,7 @@ class SegmentViewer(QMainWindow):
         # Streaming mode variables
         self.mode = 'file'  # 'file' or 'stream'
         self.streaming_active = False
+        self.stream_first_update = True  # Flag for initial auto-range on first streaming update
         self.board = None
         self.board_id = None
         self.eeg_channels = None
@@ -227,6 +228,18 @@ class SegmentViewer(QMainWindow):
         self.magnitude_scale = 100  # microvolts
         self.smoothing_enabled = False
         self.smoothing_window = 5  # samples
+
+        # Pre-calculated filter coefficients (will be computed when sampling rate is known)
+        self.filter_coeffs_valid = False
+        self.bandpass_b = None
+        self.bandpass_a = None
+        self.notch_b = None
+        self.notch_a = None
+
+        # Streaming plot item references (reused to avoid memory leak)
+        self.streaming_plot_items = {}  # Channel index -> PlotDataItem
+        self.fft_plot_items = {}  # Channel index -> PlotDataItem
+        self.band_power_bar_item = None  # Single BarGraphItem for band power
 
         # FFT and band power tracking
         self.fft_data = {}
@@ -673,7 +686,11 @@ class SegmentViewer(QMainWindow):
             else:
                 QMessageBox.warning(self, "Error", "Unsupported file type. Please select a .gdf or .pkl file.")
                 return
-            
+
+            # Reset smoothing buffers to prevent shape mismatch with previous stream/file
+            self.smoothed_fft = {}
+            self.smoothed_band_power = {}
+
             # Update UI with loaded file
             self.current_filename = file_path.split('/')[-1]
             self.file_label.setText(f"Loaded: {self.current_filename}")
@@ -683,7 +700,12 @@ class SegmentViewer(QMainWindow):
             # Prepare data and calculate window parameters
             self.prepare_data()
             self.current_window = 0
-            
+
+            # Update window length slider/spinbox maximum based on file duration
+            file_duration_sec = self.raw_data.shape[1] / self.sampling_rate
+            self.horizontal_zoom_slider.setMaximum(int(file_duration_sec * 10))  # Scale by 10
+            self.window_size_spinbox.setMaximum(file_duration_sec)
+
             # Initialize horizontal zoom tracking
             self.last_horizontal_zoom_value = int(self.window_size_sec * 10)
             
@@ -869,7 +891,8 @@ class SegmentViewer(QMainWindow):
     
     def update_window_controls_from_view(self):
         """Update slider/spinbox to match the current view range"""
-        if not self.file_loaded:
+        # Skip window control updates in streaming mode (no window navigation)
+        if self.mode == 'stream' or not self.file_loaded:
             return
         
         # Get current view range based on display mode
@@ -973,14 +996,19 @@ class SegmentViewer(QMainWindow):
     
     def custom_wheel_event(self, view_box, event):
         """Custom mouse wheel handler:
+        - Respects setMouseEnabled settings
         - Horizontal scroll (left/right): Pan time axis
         - Vertical scroll: Disabled (to prevent accidental zooming)
-        
+
         Note: pyqtgraph uses QGraphicsSceneWheelEvent, not QWheelEvent, which has
         different methods (delta() and orientation() instead of angleDelta()).
         """
-        from PyQt5.QtCore import Qt
-        
+        # Check if x-axis mouse interaction is enabled
+        # ViewBox.state['mouseEnabled'] is a list [x_bool, y_bool]
+        if not view_box.state['mouseEnabled'][0]:
+            event.accept()
+            return
+
         # Get delta value (magnitude of scroll)
         delta = event.delta()
         
@@ -1016,44 +1044,54 @@ class SegmentViewer(QMainWindow):
     
     def apply_vertical_zoom(self, value):
         """Apply vertical zoom to the plot (Y-axis zoom)
-        
+
         Args:
             value: Zoom percentage (any positive value, where 100 = normal)
         """
-        if not self.file_loaded or not self.active_channels:
+        if not self.active_channels:
             return
-        
+
         # Get the zoom factor (1.0 = 100%)
         zoom_factor = value / 100.0
-        
+
         if self.display_mode == 'overlay':
-            # Get current bounds based on mode and scale them
-            y_min, y_max = self.get_bounds_for_channels(self.active_channels)
-            y_center = (y_min + y_max) / 2.0
-            y_range = (y_max - y_min) / zoom_factor
-            
-            new_y_min = y_center - y_range / 2.0
-            new_y_max = y_center + y_range / 2.0
-            self.plot_widget.setYRange(new_y_min, new_y_max, padding=0)
+            if self.mode == 'stream' and self.streaming_active:
+                # In streaming mode, zoom based on magnitude scale setting
+                base_range = self.magnitude_scale  # microvolts
+                y_range = base_range / zoom_factor
+                self.plot_widget.setYRange(-y_range, y_range, padding=0)
+            elif self.file_loaded:
+                # File mode: use pre-calculated channel bounds
+                y_min, y_max = self.get_bounds_for_channels(self.active_channels)
+                y_center = (y_min + y_max) / 2.0
+                y_range = (y_max - y_min) / zoom_factor
+
+                new_y_min = y_center - y_range / 2.0
+                new_y_max = y_center + y_range / 2.0
+                self.plot_widget.setYRange(new_y_min, new_y_max, padding=0)
         else:
             # Stacked mode: just update the zoom factor (will be applied in next data update)
             self.stacked_vertical_zoom = zoom_factor
-            
-            # Manually update the existing plot items with new zoom
-            if self.active_channels and self.stacked_plot_items and self.stacked_plot_item is not None:
+
+            # In streaming mode, the streaming timer will apply the new zoom factor
+            if self.mode == 'stream' and self.streaming_active:
+                return
+
+            # File mode: Manually update the existing plot items with new zoom
+            if self.file_loaded and self.active_channels and self.stacked_plot_items and self.stacked_plot_item is not None:
                 # Get current view range
                 view_range = self.stacked_plot_item.viewRange()[0]
                 start_idx, end_idx = self.get_visible_data_range(view_range)
-                
+
                 # Update each channel with new zoom
                 active_list = sorted(self.active_channels)
                 channel_height = 1.0
-                
+
                 for idx, ch_idx in enumerate(active_list):
                     if ch_idx in self.stacked_plot_items:
                         data = self.raw_data[ch_idx, start_idx:end_idx]
                         time_slice = self.full_time_axis[start_idx:end_idx]
-                        
+
                         ch_min, ch_max = self.get_channel_bounds(ch_idx)
                         data_range = ch_max - ch_min
                         if data_range > 0:
@@ -1061,7 +1099,7 @@ class SegmentViewer(QMainWindow):
                             normalized_data = ((data - ch_min) / data_range - 0.5) * channel_height * 0.8 * zoom_factor
                         else:
                             normalized_data = np.zeros_like(data)
-                        
+
                         vertical_offset = idx * channel_height + channel_height * 0.5
                         offset_data = normalized_data + vertical_offset
                         
@@ -1174,69 +1212,76 @@ class SegmentViewer(QMainWindow):
 
     def on_horizontal_zoom_changed(self, value):
         """Handle horizontal zoom slider changes (time window size)
-        
+
         Args:
             value: Window size in tenths of seconds (10-600, representing 0.1-60.0 seconds)
         """
-        if not self.file_loaded:
-            return
-        
-        # Stop autoplay if active
-        if self.autoplay_active and self.autoplay_timer.isActive():
-            self.autoplay_timer.stop()
-            self.play_pause_btn.setText("▶ Play")
-        
-        # Only process if change is significant (> 1 unit = 0.1 seconds)
-        # This avoids expensive recalculations on every tiny slider movement
-        if self.last_horizontal_zoom_value is not None:
-            if abs(value - self.last_horizontal_zoom_value) < 1:
-                # Update spinbox but skip expensive recalculation
-                new_window_size = value / 10.0
-                self.window_size_spinbox.blockSignals(True)
-                self.window_size_spinbox.setValue(new_window_size)
-                self.window_size_spinbox.blockSignals(False)
-                return
-        
-        # Store this value as the last processed one
-        self.last_horizontal_zoom_value = value
-        
         # Convert slider value to seconds (slider is scaled by 10 for finer control)
         new_window_size = value / 10.0
-        
+
         # Update the spinbox
         self.window_size_spinbox.blockSignals(True)
         self.window_size_spinbox.setValue(new_window_size)
         self.window_size_spinbox.blockSignals(False)
-        
+
+        # Update window size
+        self.window_size_sec = new_window_size
+
+        # In streaming mode, apply the new X range immediately
+        if self.mode == 'stream' and self.streaming_active:
+            if hasattr(self, 'stream_time_axis') and self.stream_time_axis is not None and len(self.stream_time_axis) > 0:
+                buffer_duration = self.stream_time_axis[-1]
+                x_end = buffer_duration
+                x_start = max(0, x_end - new_window_size)
+                self.plot_widget.setXRange(x_start, x_end, padding=0)
+            return
+
+        # File mode processing below
+        if not self.file_loaded:
+            return
+
+        # Stop autoplay if active
+        if self.autoplay_active and self.autoplay_timer.isActive():
+            self.autoplay_timer.stop()
+            self.play_pause_btn.setText("▶ Play")
+
+        # Only process if change is significant (> 1 unit = 0.1 seconds)
+        # This avoids expensive recalculations on every tiny slider movement
+        if self.last_horizontal_zoom_value is not None:
+            if abs(value - self.last_horizontal_zoom_value) < 1:
+                return
+
+        # Store this value as the last processed one
+        self.last_horizontal_zoom_value = value
+
         # Get current view center BEFORE changing window size
         if self.display_mode == 'overlay':
             view_range = self.plot_widget.viewRange()[0]
         else:
             view_range = self.plot_widgets[0].viewRange()[0]
-        
+
         t_center = (view_range[0] + view_range[1]) / 2.0
-        
-        # Update window size (this affects window calculations but not the view directly)
-        self.window_size_sec = new_window_size
+
+        # Recalculate windows with new size
         self.recalculate_windows()
-        
+
         # Update navigation controls and re-calculate windows
         self.sync_navigation_controls()
-        
+
         # Calculate new view range centered on the same time point
         t_start = t_center - (new_window_size / 2.0)
         t_end = t_center + (new_window_size / 2.0)
-        
+
         # Clamp to valid time range
         t_start = max(0, t_start)
         t_end = min(self.full_time_axis[-1], t_end)
-        
+
         # Adjust center if we hit a boundary
         if t_start == 0:
             t_end = min(new_window_size, self.full_time_axis[-1])
         elif t_end == self.full_time_axis[-1]:
             t_start = max(0, self.full_time_axis[-1] - new_window_size)
-        
+
         # Set the new view range (this will trigger range_changed signal which updates window controls)
         if self.display_mode == 'overlay':
             self.plot_widget.setXRange(t_start, t_end, padding=0)
@@ -1245,52 +1290,64 @@ class SegmentViewer(QMainWindow):
     
     def on_window_size_spinbox_changed(self, value):
         """Handle window size spinbox changes"""
-        if not self.file_loaded:
-            return
-        
-        # Stop autoplay if active
-        if self.autoplay_active and self.autoplay_timer.isActive():
-            self.autoplay_timer.stop()
-            self.play_pause_btn.setText("▶ Play")
-        
         # Update slider to match
         slider_value = int(value * 10)
         self.horizontal_zoom_slider.blockSignals(True)
         self.horizontal_zoom_slider.setValue(slider_value)
         self.horizontal_zoom_slider.blockSignals(False)
-        
+
+        # Update window size
+        self.window_size_sec = value
+
+        # In streaming mode, apply the new X range immediately
+        if self.mode == 'stream' and self.streaming_active:
+            if hasattr(self, 'stream_time_axis') and self.stream_time_axis is not None and len(self.stream_time_axis) > 0:
+                buffer_duration = self.stream_time_axis[-1]
+                x_end = buffer_duration
+                x_start = max(0, x_end - value)
+                self.plot_widget.setXRange(x_start, x_end, padding=0)
+            return
+
+        # File mode processing below
+        if not self.file_loaded:
+            return
+
+        # Stop autoplay if active
+        if self.autoplay_active and self.autoplay_timer.isActive():
+            self.autoplay_timer.stop()
+            self.play_pause_btn.setText("▶ Play")
+
         # Update tracking variable
         self.last_horizontal_zoom_value = slider_value
-        
+
         # Get current view center BEFORE changing window size
         if self.display_mode == 'overlay':
             view_range = self.plot_widget.viewRange()[0]
         else:
             view_range = self.plot_widgets[0].viewRange()[0]
-        
+
         t_center = (view_range[0] + view_range[1]) / 2.0
-        
-        # Update window size (this affects window calculations but not the view directly)
-        self.window_size_sec = value
+
+        # Recalculate windows with new size
         self.recalculate_windows()
-        
+
         # Update navigation controls and re-calculate windows
         self.sync_navigation_controls()
-        
+
         # Calculate new view range centered on the same time point
         t_start = t_center - (value / 2.0)
         t_end = t_center + (value / 2.0)
-        
+
         # Clamp to valid time range
         t_start = max(0, t_start)
         t_end = min(self.full_time_axis[-1], t_end)
-        
+
         # Adjust center if we hit a boundary
         if t_start == 0:
             t_end = min(value, self.full_time_axis[-1])
         elif t_end == self.full_time_axis[-1]:
             t_start = max(0, self.full_time_axis[-1] - value)
-        
+
         # Set the new view range (this will trigger range_changed signal which updates window controls)
         if self.display_mode == 'overlay':
             self.plot_widget.setXRange(t_start, t_end, padding=0)
@@ -1333,13 +1390,13 @@ class SegmentViewer(QMainWindow):
         self.select_all_checkbox.blockSignals(False)
 
         self.update_selected_channels_label()
-        self.update_plot()
 
-        # Update FFT and band power for file mode
+        # Update plots for file mode only - streaming mode updates via timer
         if self.file_loaded and not self.streaming_active:
+            self.update_plot()
             self.calculate_fft_for_file()
             self.calculate_band_power_for_file()
-    
+
     def update_plot(self, rebuild=True):
         """Redraw plot with active channels and IQR-based bounds
         
@@ -1418,16 +1475,20 @@ class SegmentViewer(QMainWindow):
     
     def on_overlay_range_changed(self):
         """Called when user zooms or pans in overlay mode - updates visible data"""
+        # In streaming mode, the streaming timer handles data updates - just allow zoom/pan
+        if self.mode == 'stream':
+            return
+
         if not self.file_loaded or not self.active_channels:
             return
-        
+
         # Update window controls to match current view
         self.update_window_controls_from_view()
-        
+
         # Get current view range
         view_range = self.plot_widget.viewRange()[0]  # [x_min, x_max]
         start_idx, end_idx = self.get_visible_data_range(view_range)
-        
+
         # Update data for each active channel
         for ch_idx in sorted(self.active_channels):
             if ch_idx in self.overlay_plot_items:
@@ -1787,12 +1848,16 @@ class SegmentViewer(QMainWindow):
     
     def on_stacked_range_changed(self):
         """Called when user zooms or pans in stacked mode - updates visible data for all channels"""
+        # In streaming mode, the streaming timer handles data updates - just allow zoom/pan
+        if self.mode == 'stream':
+            return
+
         if not self.file_loaded or not self.active_channels or self.stacked_plot_item is None:
             return
-        
+
         # Update window controls to match current view
         self.update_window_controls_from_view()
-        
+
         # Get the X range from plot
         view_range = self.stacked_plot_item.viewRange()[0]  # [x_min, x_max]
         start_idx, end_idx = self.get_visible_data_range(view_range)
@@ -1830,10 +1895,14 @@ class SegmentViewer(QMainWindow):
     
     def navigate_to_window(self, value):
         """Navigate to a specific window and update the view
-        
+
         Args:
             value: Window index to navigate to
         """
+        # Skip in streaming mode (no window-based navigation)
+        if self.mode == 'stream':
+            return
+
         # Stop autoplay if user manually navigates
         if self.autoplay_active and self.autoplay_timer.isActive():
             self.autoplay_timer.stop()
@@ -2085,11 +2154,29 @@ class SegmentViewer(QMainWindow):
             self.file_group.setEnabled(True)
             self.stream_group.setEnabled(False)
             self.signal_group.setEnabled(False)
+            # Show bottom navigation toolbar for file mode
+            self.nav_widget.setVisible(True)
+            # Enable autoplay only if a file is loaded
+            self.autoplay_btn.setEnabled(self.file_loaded)
+            # Enable horizontal scrolling for file mode
+            if hasattr(self, 'plot_widgets') and self.plot_widgets:
+                for pw in self.plot_widgets:
+                    if hasattr(pw, 'setMouseEnabled'):
+                        pw.setMouseEnabled(x=True, y=True)
         else:
             self.mode = 'stream'
             self.file_group.setEnabled(False)
             self.stream_group.setEnabled(True)
             self.signal_group.setEnabled(True)
+            # Hide bottom navigation toolbar for streaming mode (window navigation not applicable)
+            self.nav_widget.setVisible(False)
+            # Disable autoplay in streaming mode
+            self.autoplay_btn.setEnabled(False)
+            # Disable horizontal scrolling for streaming mode
+            if hasattr(self, 'plot_widgets') and self.plot_widgets:
+                for pw in self.plot_widgets:
+                    if hasattr(pw, 'setMouseEnabled'):
+                        pw.setMouseEnabled(x=False, y=False)
 
     def auto_connect_headset(self):
         """Auto-detect and connect to EEG headset"""
@@ -2142,6 +2229,9 @@ class SegmentViewer(QMainWindow):
             buffer_size = int(self.sampling_rate * 5)
             self.stream_buffer = np.zeros((self.num_channels, buffer_size))
             self.stream_time_axis = np.arange(buffer_size) / self.sampling_rate
+
+            # Pre-calculate filter coefficients now that sampling rate is known
+            self.calculate_filter_coefficients()
 
             # Update UI
             self.connection_status.setText(f"Connected: {self.num_channels} channels @ {self.sampling_rate} Hz")
@@ -2348,10 +2438,25 @@ class SegmentViewer(QMainWindow):
         if not self.streaming_active:
             # Start streaming visualization
             self.streaming_active = True
+            self.stream_first_update = True  # Flag for initial auto-range
             self.stream_start_time = local_clock() if LSL_AVAILABLE else 0
             self.stream_timer.start(50)  # Update every 50ms (20 Hz)
             self.start_viz_btn.setText("Stop Visualization")
             self.start_viz_btn.setStyleSheet("background-color: #f44336; color: white;")
+
+            # Clear all plots and reset references BEFORE starting new visualization
+            # This ensures old data is cleared only when new data is about to replace it
+            if hasattr(self, 'plot_widget') and self.plot_widget is not None:
+                self.plot_widget.clear()
+            if hasattr(self, 'fft_plot_widget') and self.fft_plot_widget is not None:
+                self.fft_plot_widget.clear()
+            if hasattr(self, 'band_power_plot_widget') and self.band_power_plot_widget is not None:
+                self.band_power_plot_widget.clear()
+            self.streaming_plot_items.clear()
+            self.fft_plot_items.clear()
+            self.band_power_bar_item = None
+            self.smoothed_fft.clear()
+            self.smoothed_band_power.clear()
 
             # Setup visualization
             self.file_loaded = True
@@ -2364,22 +2469,35 @@ class SegmentViewer(QMainWindow):
             else:
                 self.setup_stacked_mode()
 
+            # Disable horizontal scrolling for streaming mode
+            if hasattr(self, 'plot_widgets') and self.plot_widgets:
+                for pw in self.plot_widgets:
+                    if hasattr(pw, 'setMouseEnabled'):
+                        pw.setMouseEnabled(x=False, y=False)
+
             # Enable controls
             self.vertical_zoom_slider.setEnabled(True)
             self.vertical_zoom_spinbox.setEnabled(True)
             self.bounds_mode_combo.setEnabled(True)
+            self.horizontal_zoom_slider.setEnabled(True)
+            self.window_size_spinbox.setEnabled(True)
+
+            # Disable mode switching while streaming is active
+            self.file_mode_radio.setEnabled(False)
+            self.stream_mode_radio.setEnabled(False)
 
         else:
             # Stop streaming visualization
+            # Keep graphs visible - they will be cleared when new visualization starts
             self.streaming_active = False
             self.stream_timer.stop()
             self.start_viz_btn.setText("Start Visualization")
             self.start_viz_btn.setStyleSheet("")
             self.file_loaded = False
 
-            # Clear plot
-            if hasattr(self, 'plot_widget') and self.plot_widget is not None:
-                self.plot_widget.clear()
+            # Re-enable mode switching
+            self.file_mode_radio.setEnabled(True)
+            self.stream_mode_radio.setEnabled(True)
 
     def update_stream_data(self):
         """Update visualization with new streaming data"""
@@ -2396,10 +2514,11 @@ class SegmentViewer(QMainWindow):
             # Extract EEG channels
             eeg_data = data[self.eeg_channels, :]
 
-            # Send to LSL if outlet is active
+            # Send to LSL if outlet is active - use push_chunk for efficiency
             if self.eeg_outlet is not None and LSL_AVAILABLE:
-                for i in range(eeg_data.shape[1]):
-                    self.eeg_outlet.push_sample(eeg_data[:, i].tolist())
+                # Transpose to [samples, channels] and push entire chunk at once
+                chunk = eeg_data.T.tolist()
+                self.eeg_outlet.push_chunk(chunk)
 
             # Apply signal processing
             processed_data = self.process_signal(eeg_data)
@@ -2429,28 +2548,40 @@ class SegmentViewer(QMainWindow):
         except Exception as e:
             print(f"Error updating stream: {str(e)}")
 
+    def calculate_filter_coefficients(self):
+        """Pre-calculate filter coefficients for efficient signal processing"""
+        if not SCIPY_AVAILABLE:
+            self.filter_coeffs_valid = False
+            return
+
+        try:
+            # Bandpass filter coefficients (5-35 Hz)
+            self.bandpass_b, self.bandpass_a = butter(
+                2, [self.lowcut, self.highcut], btype='band', fs=self.sampling_rate
+            )
+            # Notch filter coefficients (60 Hz)
+            self.notch_b, self.notch_a = iirnotch(self.notch_freq, 30, fs=self.sampling_rate)
+            self.filter_coeffs_valid = True
+        except Exception as e:
+            print(f"Error calculating filter coefficients: {e}")
+            self.filter_coeffs_valid = False
+
     def process_signal(self, data):
-        """Apply signal processing to raw data"""
+        """Apply signal processing to raw data using pre-calculated filter coefficients"""
         processed = np.zeros_like(data)
 
         for i in range(data.shape[0]):
             channel_data = data[i, :].copy()
 
-            # Bandpass filter (5-35 Hz)
-            if SCIPY_AVAILABLE:
+            # Use pre-calculated filter coefficients for efficiency
+            if SCIPY_AVAILABLE and self.filter_coeffs_valid:
                 try:
-                    b, a = butter(2, [self.lowcut, self.highcut], btype='band', fs=self.sampling_rate)
-                    channel_data = lfilter(b, a, channel_data)
+                    # Bandpass filter (5-35 Hz)
+                    channel_data = lfilter(self.bandpass_b, self.bandpass_a, channel_data)
+                    # Notch filter (60 Hz)
+                    channel_data = lfilter(self.notch_b, self.notch_a, channel_data)
                 except:
                     pass  # Skip if not enough data
-
-            # Notch filter (60 Hz)
-            if SCIPY_AVAILABLE:
-                try:
-                    b, a = iirnotch(self.notch_freq, 30, fs=self.sampling_rate)
-                    channel_data = lfilter(b, a, channel_data)
-                except:
-                    pass
 
             # Apply magnitude scaling
             channel_data = channel_data * (self.magnitude_scale / 100.0)
@@ -2468,38 +2599,65 @@ class SegmentViewer(QMainWindow):
         return processed
 
     def update_streaming_plots(self):
-        """Update plot widgets with streaming data"""
+        """Update plot widgets with streaming data - reuses plot items for performance"""
         if not self.active_channels:
+            if hasattr(self, 'plot_widget') and self.plot_widget is not None:
+                self.plot_widget.clear()
+                self.streaming_plot_items.clear()
             return
 
         # Update the main plot (use overlay mode for simplicity in streaming)
         if hasattr(self, 'plot_widget') and self.plot_widget is not None:
-            self.plot_widget.clear()
-
             colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
 
+            # Check if active channels match current plot items
+            current_plotted_channels = set(self.streaming_plot_items.keys())
+
+            # If the selection has changed, clear everything and start fresh
+            if current_plotted_channels != self.active_channels:
+                self.plot_widget.clear()
+                self.streaming_plot_items.clear()
+
+            # Update or create plot items for active channels
             for ch_idx in sorted(self.active_channels):
                 if ch_idx < self.num_channels:
                     data = self.stream_buffer[ch_idx, :]
                     color = colors[ch_idx % len(colors)]
 
-                    self.plot_widget.plot(
-                        self.stream_time_axis,
-                        data,
-                        pen=pg.mkPen(color=color, width=2),
-                        name=f'Ch{ch_idx+1}'
-                    )
+                    if ch_idx in self.streaming_plot_items:
+                        # Reuse existing plot item - just update data
+                        self.streaming_plot_items[ch_idx].setData(self.stream_time_axis, data)
+                    else:
+                        # Create new plot item for this channel
+                        plot_item = self.plot_widget.plot(
+                            self.stream_time_axis,
+                            data,
+                            pen=pg.mkPen(color=color, width=2),
+                            name=f'Ch{ch_idx+1}'
+                        )
+                        self.streaming_plot_items[ch_idx] = plot_item
 
-            # Auto-range
-            self.plot_widget.enableAutoRange()
+            # On first update, use auto-range to determine initial zoom
+            if self.stream_first_update:
+                self.stream_first_update = False
+                self.plot_widget.enableAutoRange()
 
     def update_fft(self):
-        """Calculate and display FFT for active channels with smoothing"""
+        """Calculate and display FFT for active channels with smoothing - reuses plot items"""
         if not self.active_channels or self.stream_buffer is None:
+            # Clear the plot when no channels are selected
+            if hasattr(self, 'fft_plot_widget') and self.fft_plot_widget is not None:
+                self.fft_plot_widget.clear()
+                self.fft_plot_items.clear()
             return
 
-        self.fft_plot_widget.clear()
         colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
+
+        # Remove plot items for channels that are no longer active
+        channels_to_remove = [ch for ch in self.fft_plot_items if ch not in self.active_channels]
+        for ch_idx in channels_to_remove:
+            self.fft_plot_widget.removeItem(self.fft_plot_items[ch_idx])
+            del self.fft_plot_items[ch_idx]
 
         for ch_idx in sorted(self.active_channels):
             if ch_idx < self.num_channels:
@@ -2524,22 +2682,32 @@ class SegmentViewer(QMainWindow):
                     # First time, initialize with current value
                     self.smoothed_fft[ch_idx] = fft_power[mask].copy()
 
-                # Plot smoothed FFT only up to 50 Hz
+                # Update or create plot item
                 color = colors[ch_idx % len(colors)]
 
-                self.fft_plot_widget.plot(
-                    fft_freq[mask],
-                    self.smoothed_fft[ch_idx],
-                    pen=pg.mkPen(color=color, width=2),
-                    name=f'Ch{ch_idx+1}'
-                )
+                if ch_idx in self.fft_plot_items:
+                    # Reuse existing plot item - just update data
+                    self.fft_plot_items[ch_idx].setData(fft_freq[mask], self.smoothed_fft[ch_idx])
+                else:
+                    # Create new plot item for this channel
+                    plot_item = self.fft_plot_widget.plot(
+                        fft_freq[mask],
+                        self.smoothed_fft[ch_idx],
+                        pen=pg.mkPen(color=color, width=2),
+                        name=f'Ch{ch_idx+1}'
+                    )
+                    self.fft_plot_items[ch_idx] = plot_item
 
                 # Store for reference
                 self.fft_data[ch_idx] = (fft_freq[mask], self.smoothed_fft[ch_idx])
 
     def update_band_power(self):
-        """Calculate and display band power for active channels"""
+        """Calculate and display band power for active channels - reuses bar graph item"""
         if not self.active_channels or self.stream_buffer is None:
+            # Clear the plot when no channels are selected
+            if hasattr(self, 'band_power_plot_widget') and self.band_power_plot_widget is not None:
+                self.band_power_plot_widget.clear()
+                self.band_power_bar_item = None
             return
 
         if not SCIPY_AVAILABLE:
@@ -2553,9 +2721,6 @@ class SegmentViewer(QMainWindow):
             'Beta': (13, 30),
             'Gamma': (30, 50)
         }
-
-        self.band_power_plot_widget.clear()
-        colors = ['r', 'g', 'b', 'c', 'm', 'y', 'w', 'orange']
 
         # Average across all active channels
         band_powers = {band: 0.0 for band in bands.keys()}
@@ -2598,13 +2763,18 @@ class SegmentViewer(QMainWindow):
         band_values = [self.smoothed_band_power[name] for name in band_names]
         x_pos = np.arange(len(band_names))
 
-        # Create bar graph
-        bargraph = pg.BarGraphItem(x=x_pos, height=band_values, width=0.6, brush='b')
-        self.band_power_plot_widget.addItem(bargraph)
+        # Reuse or create bar graph item
+        if self.band_power_bar_item is None:
+            # First time: create bar graph and add to widget
+            self.band_power_bar_item = pg.BarGraphItem(x=x_pos, height=band_values, width=0.6, brush='b')
+            self.band_power_plot_widget.addItem(self.band_power_bar_item)
 
-        # Set x-axis labels
-        ax = self.band_power_plot_widget.getAxis('bottom')
-        ax.setTicks([[(i, band_names[i]) for i in range(len(band_names))]])
+            # Set x-axis labels (only needs to be done once)
+            ax = self.band_power_plot_widget.getAxis('bottom')
+            ax.setTicks([[(i, band_names[i]) for i in range(len(band_names))]])
+        else:
+            # Update existing bar graph item
+            self.band_power_bar_item.setOpts(height=band_values)
 
     def motor_imagery_task_placeholder(self):
         """Placeholder for motor imagery task - to be integrated later"""
@@ -2649,7 +2819,12 @@ class SegmentViewer(QMainWindow):
             self.active_channels.clear()
 
         self.update_selected_channels_label()
-        self.update_plot()
+
+        # Update plots for file mode only - streaming mode updates via timer
+        if self.file_loaded and not self.streaming_active:
+            self.update_plot()
+            self.calculate_fft_for_file()
+            self.calculate_band_power_for_file()
 
     def update_selected_channels_label(self):
         """Update the label showing selected channels"""
@@ -2735,6 +2910,9 @@ class SegmentViewer(QMainWindow):
     def calculate_fft_for_file(self):
         """Calculate and display FFT for file mode with smoothing"""
         if not self.active_channels or self.raw_data is None:
+            # Clear the plot when no channels are selected
+            if hasattr(self, 'fft_plot_widget') and self.fft_plot_widget is not None:
+                self.fft_plot_widget.clear()
             return
 
         if not SCIPY_AVAILABLE:
@@ -2758,17 +2936,24 @@ class SegmentViewer(QMainWindow):
                 fft_power = 20 * np.log10(np.abs(fft_vals) + 1e-10)
 
                 # Apply exponential moving average smoothing
+                mask = fft_freq <= 50
+                new_fft_data = fft_power[mask]
+
+                # Check if smoothed buffer exists and has correct shape
+                if ch_idx in self.smoothed_fft:
+                    if self.smoothed_fft[ch_idx].shape != new_fft_data.shape:
+                        # Shape mismatch (window size changed), reset buffer
+                        del self.smoothed_fft[ch_idx]
+
                 if ch_idx in self.smoothed_fft:
                     # EMA: smoothed = alpha * new + (1 - alpha) * smoothed
-                    mask = fft_freq <= 50
                     self.smoothed_fft[ch_idx] = (
-                        self.fft_smoothing_alpha * fft_power[mask] +
+                        self.fft_smoothing_alpha * new_fft_data +
                         (1 - self.fft_smoothing_alpha) * self.smoothed_fft[ch_idx]
                     )
                 else:
-                    # First time, initialize with current value
-                    mask = fft_freq <= 50
-                    self.smoothed_fft[ch_idx] = fft_power[mask].copy()
+                    # First time or shape changed, initialize with current value
+                    self.smoothed_fft[ch_idx] = new_fft_data.copy()
 
                 # Plot smoothed FFT only up to 50 Hz
                 mask = fft_freq <= 50
@@ -2784,6 +2969,9 @@ class SegmentViewer(QMainWindow):
     def calculate_band_power_for_file(self):
         """Calculate and display band power for file mode with smoothing"""
         if not self.active_channels or self.raw_data is None:
+            # Clear the plot when no channels are selected
+            if hasattr(self, 'band_power_plot_widget') and self.band_power_plot_widget is not None:
+                self.band_power_plot_widget.clear()
             return
 
         if not SCIPY_AVAILABLE:
@@ -2854,7 +3042,6 @@ class SegmentViewer(QMainWindow):
 
     def keyPressEvent(self, event):
         """Handle keyboard shortcuts"""
-        from PyQt5.QtCore import Qt
 
         # Spacebar toggles play/pause when in autoplay mode
         if event.key() == Qt.Key_Space:
