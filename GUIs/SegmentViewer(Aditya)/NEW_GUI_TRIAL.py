@@ -159,6 +159,7 @@ class SegmentViewer(QMainWindow):
         self.window_size_sec = window_size_sec
         self.sampling_rate = sampling_rate
         self.display_mode = 'stacked'  # 'overlay' or 'stacked'
+        self.stacked_plot_item = None  # Created in setup_stacked_mode()
         self.file_loaded = False
         self.current_filename = ""
         self.theme = 'dark'  # 'light' or 'dark'
@@ -184,6 +185,9 @@ class SegmentViewer(QMainWindow):
         self.yRange = 100.0  # Default 100 uV scale
         # Total vertical span for auto-spacing: divided among active channels
         self.total_y_span = 1600.0
+        # Amplitude scale factor for stacked mode (1.0 = normal, >1 = zoomed in)
+        # This scales signal amplitude WITHIN each channel lane without changing lane spacing
+        self.channel_amplitude_scale = 1.0
 
         # Available yRange presets for combo box
         self.yRange_presets = {
@@ -857,20 +861,55 @@ class SegmentViewer(QMainWindow):
         self.stacked_plot_item.setMouseEnabled(x=True, y=False)  # Only allow X panning
         self.stacked_plot_item.setMenuEnabled(False)
 
-        # Install wheel event for Y-scale zooming (adjusts total_y_span)
+        # Install wheel event: horizontal scroll = pan time, vertical scroll = amplitude zoom
         view_box = self.stacked_plot_item.getViewBox()
-        def wheel_handler(event):
-            delta = event.angleDelta().y() // 120  # One notch = 120
-            if delta != 0:
-                scale_factor = 1.2
-                if delta < 0:
-                    self.total_y_span *= scale_factor
-                else:
-                    self.total_y_span /= scale_factor
-                # Clamp to reasonable bounds
-                self.total_y_span = max(1.0, min(self.total_y_span, 10000000))
-                # Redraw with new scale
-                self.update_plot_stacked(rebuild_layout=False)
+        def wheel_handler(event, axis=None):
+            delta = event.delta()
+            if delta == 0:
+                event.accept()
+                return
+
+            # pyqtgraph passes axis=0 for X, axis=1 for Y from AxisItem
+            # Also check event orientation for direct wheel events
+            if axis == 0:
+                orientation = Qt.Horizontal
+            elif axis == 1:
+                orientation = Qt.Vertical
+            elif hasattr(event, 'orientation'):
+                orientation = event.orientation()
+            else:
+                orientation = Qt.Vertical
+
+            if orientation == Qt.Horizontal:
+                # Horizontal scroll: pan time axis
+                x_range = view_box.viewRange()[0]
+                x_size = x_range[1] - x_range[0]
+                pan_amount = -delta * 0.1 * x_size / 120.0
+                view_box.setXRange(x_range[0] + pan_amount, x_range[1] + pan_amount, padding=0)
+            else:
+                # Vertical scroll: adjust per-channel amplitude scale
+                notches = delta // 120
+                if notches != 0:
+                    scale_factor = 1.2
+                    if notches > 0:
+                        self.channel_amplitude_scale *= scale_factor
+                    else:
+                        self.channel_amplitude_scale /= scale_factor
+                    # Clamp to reasonable bounds
+                    self.channel_amplitude_scale = max(0.001, min(self.channel_amplitude_scale, 10000))
+                    # Sync the vertical zoom slider/spinbox to match
+                    slider_val = int(self.channel_amplitude_scale * 100)
+                    self.vertical_zoom_slider.blockSignals(True)
+                    self.vertical_zoom_spinbox.blockSignals(True)
+                    self.vertical_zoom_slider.setValue(max(10, min(500, slider_val)))
+                    self.vertical_zoom_spinbox.setValue(slider_val)
+                    self.vertical_zoom_slider.blockSignals(False)
+                    self.vertical_zoom_spinbox.blockSignals(False)
+                    # Redraw — route to correct update function
+                    if self.mode == 'stream' and self.streaming_active:
+                        self.update_streaming_plots()
+                    elif self.file_loaded:
+                        self.update_plot_stacked(rebuild_layout=False)
             event.accept()
         view_box.wheelEvent = wheel_handler
 
@@ -916,6 +955,7 @@ class SegmentViewer(QMainWindow):
         
         for ch_idx in range(self.num_channels):
             # Get all data for this channel
+            if self.raw_data is None: return
             channel_data = self.raw_data[ch_idx, :]
             
             # IQR bounds
@@ -953,9 +993,9 @@ class SegmentViewer(QMainWindow):
         self.window_size_samples = int(self.window_size_sec * self.sampling_rate)
         self.stride = int(self.window_size_samples * 0.8)  # 20% overlap
         
-        # Calculate number of windows
+        # Calculate number of windows (at least 1 if there's any data)
         total_samples = self.raw_data.shape[1]
-        self.num_windows = (total_samples - self.window_size_samples) // self.stride + 1
+        self.num_windows = max(1, (total_samples - self.window_size_samples) // self.stride + 1)
         self.num_channels = self.raw_data.shape[0]
         self.num_samples_per_window = self.window_size_samples
         
@@ -1017,9 +1057,10 @@ class SegmentViewer(QMainWindow):
             self.spinbox.blockSignals(False)
     
     def get_window_bounds(self, window_idx):
-        """Get start and end sample indices for a given window"""
-        start_sample = window_idx * self.stride
-        end_sample = start_sample + self.window_size_samples
+        """Get start and end sample indices for a given window, clamped to valid range"""
+        total_samples = len(self.full_time_axis)
+        start_sample = max(0, window_idx * self.stride)
+        end_sample = min(start_sample + self.window_size_samples, total_samples)
         return start_sample, end_sample
     
     def get_iqr_bounds_for_channels(self, channel_indices):
@@ -1165,15 +1206,16 @@ class SegmentViewer(QMainWindow):
                 new_y_max = y_center + y_range / 2.0
                 self.plot_widget.setYRange(new_y_min, new_y_max, padding=0)
         else:
-            # Stacked mode: adjust total_y_span based on zoom
-            # Higher zoom = smaller total_y_span (signals appear bigger)
-            base_span = 1600.0  # Base total span
-            self.total_y_span = base_span / zoom_factor
-            self.total_y_span = max(1.0, min(self.total_y_span, 10000000))
+            # Stacked mode: scale signal amplitude within each channel lane
+            # Lane spacing stays fixed; signals get bigger/smaller within their lanes
+            self.channel_amplitude_scale = zoom_factor
 
-            # Redraw with new scale
-            if self.file_loaded and self.stacked_plot_item is not None:
-                self.update_plot_stacked(rebuild_layout=False)
+            # Redraw with new scale — route to the correct update function
+            if self.stacked_plot_item is not None:
+                if self.mode == 'stream' and self.streaming_active:
+                    self.update_streaming_plots()
+                elif self.file_loaded:
+                    self.update_plot_stacked(rebuild_layout=False)
     
     def on_vertical_zoom_slider_changed(self, value):
         """Handle vertical zoom slider changes
@@ -1277,8 +1319,10 @@ class SegmentViewer(QMainWindow):
         # Get current view center BEFORE changing window size
         if self.display_mode == 'overlay':
             view_range = self.plot_widget.viewRange()[0]
+        elif self.stacked_plot_item is not None:
+            view_range = self.stacked_plot_item.viewRange()[0]
         else:
-            view_range = self.plot_widgets[0].viewRange()[0]
+            return
 
         t_center = (view_range[0] + view_range[1]) / 2.0
 
@@ -1306,7 +1350,7 @@ class SegmentViewer(QMainWindow):
         if self.display_mode == 'overlay':
             self.plot_widget.setXRange(t_start, t_end, padding=0)
         else:
-            self.plot_widgets[0].setXRange(t_start, t_end, padding=0)
+            self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
     
     def on_window_size_spinbox_changed(self, value):
         """Handle window size spinbox changes"""
@@ -1339,8 +1383,10 @@ class SegmentViewer(QMainWindow):
         # Get current view center BEFORE changing window size
         if self.display_mode == 'overlay':
             view_range = self.plot_widget.viewRange()[0]
+        elif self.stacked_plot_item is not None:
+            view_range = self.stacked_plot_item.viewRange()[0]
         else:
-            view_range = self.plot_widgets[0].viewRange()[0]
+            return
 
         t_center = (view_range[0] + view_range[1]) / 2.0
 
@@ -1368,7 +1414,7 @@ class SegmentViewer(QMainWindow):
         if self.display_mode == 'overlay':
             self.plot_widget.setXRange(t_start, t_end, padding=0)
         else:
-            self.plot_widgets[0].setXRange(t_start, t_end, padding=0)
+            self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
     
     def on_sampling_rate_changed(self, value):
         """Handle sampling rate spinbox changes"""
@@ -1561,7 +1607,7 @@ class SegmentViewer(QMainWindow):
 
             # Create plot items for each channel
             for k, ch_idx in enumerate(active_list):
-                offset_data = (all_data[k] - all_means[k]) + offsets[k]
+                offset_data = (all_data[k] - all_means[k]) * self.channel_amplitude_scale + offsets[k]
 
                 # Get color for this channel
                 color = pg.mkColor(self.channel_colors[ch_idx % len(self.channel_colors)])
@@ -1590,7 +1636,7 @@ class SegmentViewer(QMainWindow):
             # Just update data for existing plot items (fast path)
             for k, ch_idx in enumerate(active_list):
                 if ch_idx in self.stacked_plot_items:
-                    offset_data = (all_data[k] - all_means[k]) + offsets[k]
+                    offset_data = (all_data[k] - all_means[k]) * self.channel_amplitude_scale + offsets[k]
                     self.stacked_plot_items[ch_idx].setData(time_slice, offset_data)
 
             # Update Y-axis ticks (in case spacing changed)
@@ -1643,7 +1689,7 @@ class SegmentViewer(QMainWindow):
         # Update data for all active channels
         for k, ch_idx in enumerate(active_list):
             if ch_idx in self.stacked_plot_items:
-                offset_data = (all_data[k] - all_means[k]) + offsets[k]
+                offset_data = (all_data[k] - all_means[k]) * self.channel_amplitude_scale + offsets[k]
                 self.stacked_plot_items[ch_idx].setData(time_slice, offset_data)
 
     def navigate_to_window(self, value):
@@ -1727,9 +1773,10 @@ class SegmentViewer(QMainWindow):
             self.plot_widget.setYRange(y_min, y_max, padding=0)
             self.plot_widget.setXRange(t_start, t_end, padding=0)
         else:
-            # Stacked mode: reset total_y_span and recalculate
+            # Stacked mode: reset total_y_span and amplitude scale
             if self.stacked_plot_item is not None:
                 self.total_y_span = 1600.0  # Reset to default
+                self.channel_amplitude_scale = 1.0
                 self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
                 num_active = len(self.active_channels)
                 d = self.compute_channel_spacing(num_active)
@@ -1756,7 +1803,7 @@ class SegmentViewer(QMainWindow):
         else:
             # Start or resume playing from current view position
             self.autoplay_active = True
-            view_range = self.plot_widgets[0].viewRange()
+            view_range = self.stacked_plot_item.viewRange()
             self.autoplay_current_time = (view_range[0][0] + view_range[0][1]) / 2
             self._last_frame_time = time.perf_counter()
             self.autoplay_timer.start(33)
@@ -1836,7 +1883,7 @@ class SegmentViewer(QMainWindow):
 
             for k, ch_idx in enumerate(active_list):
                 if ch_idx in self.stacked_plot_items:
-                    offset_data = (all_data[k] - all_means[k]) + offsets[k]
+                    offset_data = (all_data[k] - all_means[k]) * self.channel_amplitude_scale + offsets[k]
                     self.stacked_plot_items[ch_idx].setData(time_slice, offset_data)
 
         # Re-enable repaints and trigger a single redraw
@@ -2464,7 +2511,7 @@ class SegmentViewer(QMainWindow):
                 for k, ch_idx in enumerate(active_list):
                     if ch_idx < self.num_channels:
                         data = self.smooth_display_data(self.stream_buffer[ch_idx, :])
-                        offset_data = (data - np.nanmean(data)) + offsets[k]
+                        offset_data = (data - np.nanmean(data)) * self.channel_amplitude_scale + offsets[k]
                         color = pg.mkColor(self.channel_colors[ch_idx % len(self.channel_colors)])
 
                         plot_item = self.stacked_plot_item.plot(
@@ -2489,7 +2536,7 @@ class SegmentViewer(QMainWindow):
                 for k, ch_idx in enumerate(active_list):
                     if ch_idx in self.streaming_plot_items and ch_idx < self.num_channels:
                         data = self.smooth_display_data(self.stream_buffer[ch_idx, :])
-                        offset_data = (data - np.nanmean(data)) + offsets[k]
+                        offset_data = (data - np.nanmean(data)) * self.channel_amplitude_scale + offsets[k]
                         self.streaming_plot_items[ch_idx].setData(self.stream_time_axis, offset_data)
 
             # Update scale label and fix X range to full buffer window
