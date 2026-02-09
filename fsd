@@ -1,0 +1,69 @@
+[33m650f8bb[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mSignals_2526[m[33m, [m[1;31morigin/Signals_2526[m[33m)[m hella bugfix
+[33mf4152cf[m Now with real-time Streaming!
+[33m5e8a72b[m Added data validation code
+[33mff42109[m Now with color-coded bound labels in stacked mode. Revert to previous commit if that appearance is preferred for some reason.
+[33m1562692[m improved stacked interface with bounds for each channel but shared overall graph allowing for smooth display of 16+ channels
+[33m04aedd8[m Improved vertical scaling, added toggle between IQR-based and MinMax based vertical bounds
+[33m93d7897[m Added play/pause functionality with spacebar on keyboard
+[33m68ed884[m remove all pycache - the gitignore in the outer folder should prevent anyone from uploading pycache files.
+[33m4ad0a66[m no DS_Store
+[33mf2e1ffe[m reqs
+[33m81e4f98[m lol
+[33m0bcc06d[m lol
+[33mab99bea[m Merge branch 'Signals_2526' of https://github.com/LonghornNeurotech/LHNTDataCollection into Signals_2526
+[33md56371f[m added LDA, CAR filters, Riley's temporal file as well
+[33m5e971c7[m some sort of autoplay
+[33m0a047e4[m Clean Up
+[33m56698fb[m Merge branch 'Signals_2526' of https://github.com/LonghornNeurotech/LHNTDataCollection into Signals_2526
+[33m91c0840[m Push
+[33m45ad144[m gui commit
+[33mb054ef6[m aditya gui commit
+[33m69ce69a[m Cleaning Up Branch
+[33mb3a738f[m gitignore to keep datsets clean
+[33me9668b8[m Testing Data
+[33m8f9d065[m Centralizing
+[33mf1523a4[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m, [m[1;32mmain[m[33m)[m update readme
+[33ma1c8fa6[m Update data_flow.md
+[33m4a81eef[m Create RT_preprocess.py
+[33m2f676dc[m Update data_collection_gui.py
+[33mf0d7fdc[m Removed z-score normalization
+[33md85f334[m Added comments for functions implemented by signals team
+[33m1ac4788[m Fixed bug with repeat uploads of session directory
+[33m0cd8b6b[m Merge pull request #2 from LonghornNeurotech/buffer-screen
+[33m9de70e2[m Added line spacing and comments for better organized and more informative code!
+[33mdfad618[m Implemented the buffer screen!
+[33m3cb84ee[m added requirements.txt
+[33m8bfc033[m update developer token
+[33m463d251[m Co-authored-by: Maddox Fletcher Finalized data storing pipeline
+[33me18a613[m Changed trial increment to be only after right loading bar
+[33mff71fe4[m Merge branch 'main' of https://github.com/LonghornNeurotech/LHNTDataCollection
+[33me8a8abc[m Fixed bug with entering number of trials
+[33m3cd728e[m User tracking parameter changes
+[33me2ee586[m Update date_collection_gui.py with file zipping
+[33mb776e31[m Co-authored-by: fletchere171 <fletchere171@users.noreply.github.com>
+[33m800cb53[m Create download_and_upload.py
+[33m7fa1bcb[m Merge pull request #1 from JellyfishSpot/main
+[33m0b4a837[m Merge branch 'main' into main
+[33mf717c15[m After Session Menu
+[33m4e5a6d4[m Merge branch 'LonghornNeurotech:main' into main
+[33m04db295[m button data structure
+[33m78fdc5a[m button functionality
+[33m81f1008[m structure finished
+[33m07b5486[m boxes
+[33m92ad0a3[m buttons and textfields added
+[33m423ee6a[m added screen for questionaire
+[33m1f6b665[m Update documentation folder name
+[33mea61bd8[m Update data_flow.md
+[33md328cca[m Create data_flow.md
+[33m3e645e0[m Delete Data_Collection_Flow.drawio
+[33m938072e[m Added chart for flow of data
+[33mba7b7bf[m Update README.md
+[33m1d964f5[m Update data_collection_gui.py
+[33meaea075[m Merge branch 'main' of https://github.com/LonghornNeurotech/LHNTDataCollection
+[33m23bd4df[m Update README.md
+[33mcbceabc[m Update README.md
+[33m090d574[m Delete DESCRIPTION.md
+[33m8e1de35[m Create README.md
+[33m9bc6fd7[m Update data_collection_gui.py
+[33me3db709[m Update DESCRIPTION.md
+[33m65e79d0[m Add files via upload
