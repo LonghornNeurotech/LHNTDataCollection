@@ -29,6 +29,14 @@ except ImportError:
     SERIAL_AVAILABLE = False
     print("Warning: pyserial not available. Install with: pip install pyserial")
 
+# XDF recording imports
+try:
+    import pyxdf
+    XDF_AVAILABLE = True
+except ImportError:
+    XDF_AVAILABLE = False
+    print("Warning: pyxdf not available. Install with: pip install pyxdf")
+
 # Signal processing imports
 try:
     from scipy.signal import butter, lfilter, lfilter_zi, iirnotch
@@ -55,7 +63,7 @@ except ImportError:
     print("Warning: BrainFlow not available. Install with: pip install brainflow")
 
 # Import your data loading functions
-from conversions import get_gdf_array, get_pkl_array
+from conversions import get_gdf_array, get_pkl_array, get_xdf_array
 
 
 def find_headset_port():
@@ -139,6 +147,10 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
         self.setLayout(layout)
+
+        # Marker visualization variables
+        self.file_markers = []  # List of (time_seconds, marker_label) tuples from loaded file
+        self.marker_lines = []  # List of InfiniteLine objects for marker visualization
 
     def get_mode(self):
         """Return selected display mode"""
@@ -229,6 +241,15 @@ class SegmentViewer(QMainWindow):
         self.stream_start_time = 0
         self.patient_id = ""
         self.trial_number = 1
+
+        # Recording variables
+        self.recording_active = False
+        self.recording_buffer = {'eeg': [], 'markers': [], 'eeg_timestamps': [], 'marker_timestamps': []}
+        self.recording_start_time = None
+        self.recording_filepath = None
+        self.recording_timer = QTimer()
+        self.recording_timer.timeout.connect(self.update_recording_status)
+        self.recording_duration = 0.0  # seconds
 
         # Signal processing parameters
         self.lowcut = 5.0
@@ -367,6 +388,19 @@ class SegmentViewer(QMainWindow):
         self.start_viz_btn.clicked.connect(self.toggle_streaming_visualization)
         self.start_viz_btn.setEnabled(False)
         stream_layout.addWidget(self.start_viz_btn)
+
+        # === NEW: Recording Status ===
+        stream_layout.addWidget(QLabel("Recording:"))
+        self.recording_status = QLabel("Recording: Inactive")
+        self.recording_status.setStyleSheet("color: gray;")
+        stream_layout.addWidget(self.recording_status)
+
+        # === NEW: Download Recording Button ===
+        self.download_recording_btn = QPushButton("💾 Download Recording")
+        self.download_recording_btn.clicked.connect(self.download_recording)
+        self.download_recording_btn.setEnabled(False)
+        self.download_recording_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        stream_layout.addWidget(self.download_recording_btn)
 
         # Motor imagery task button (placeholder)
         self.motor_imagery_btn = QPushButton("Motor Imagery Task")
@@ -688,12 +722,12 @@ class SegmentViewer(QMainWindow):
         self.resize(1600, 900)  # Default 16:9 size
 
     def load_file(self):
-        """Open file dialog to load .gdf or .pkl file"""
+        """Open file dialog to load.gdf,.pkl, or.xdf file"""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open EEG File",
             "",
-            "EEG Files (*.gdf *.pkl);;GDF Files (*.gdf);;Pickle Files (*.pkl);;All Files (*)"
+            "EEG Files (*.gdf *.pkl *.xdf);;GDF Files (*.gdf);;Pickle Files (*.pkl);;XDF Files (*.xdf);;All Files (*)"
         )
         
         if not file_path:
@@ -705,8 +739,10 @@ class SegmentViewer(QMainWindow):
                 self.raw_data, file_metadata = get_gdf_array(file_path)
             elif file_path.endswith('.pkl'):
                 self.raw_data, file_metadata = get_pkl_array(file_path)
+            elif file_path.endswith('.xdf'):
+                self.raw_data, file_metadata = get_xdf_array(file_path)
             else:
-                QMessageBox.warning(self, "Error", "Unsupported file type. Please select a .gdf or .pkl file.")
+                QMessageBox.warning(self, "Error", "Unsupported file type. Please select a.gdf,.pkl, or.xdf file.")
                 return
 
             # Apply metadata from file (sampling rate, channel names)
@@ -719,6 +755,12 @@ class SegmentViewer(QMainWindow):
                 self.channel_names = file_metadata['ch_names']
             else:
                 self.channel_names = []
+            
+            # === NEW: Store markers from XDF file ===
+            if 'markers' in file_metadata:
+                self.file_markers = file_metadata['markers']  # List of (time, label) tuples
+            else:
+                self.file_markers = []
 
             # Reset smoothing buffers and plot items to prevent shape mismatch with previous stream/file
             self.smoothed_fft = {}
@@ -1531,7 +1573,10 @@ class SegmentViewer(QMainWindow):
         self.plot_widget.setXRange(t_start, t_end, padding=0)
         
         self.plot_widget.addLegend()
-    
+
+        # === NEW: Add marker visualization ===
+        self.update_marker_visualization()
+
     def on_overlay_range_changed(self):
         """Called when user zooms or pans in overlay mode - updates visible data"""
         if self.mode == 'stream' or self._skip_range_update:
@@ -1553,7 +1598,11 @@ class SegmentViewer(QMainWindow):
                 data = self.raw_data[ch_idx, start_idx:end_idx]
                 time_slice = self.full_time_axis[start_idx:end_idx]
                 self.overlay_plot_items[ch_idx].setData(time_slice, data)
-    
+        
+        # Update marker visualization when view changes
+        self.update_marker_visualization()
+
+
     def update_plot_stacked(self, rebuild_layout=True):
         """Update plots in stacked mode - mne-lsl style with vertical offsets.
 
@@ -1656,6 +1705,72 @@ class SegmentViewer(QMainWindow):
 
         # Set X range to current window
         self.stacked_plot_item.setXRange(t_start, t_end, padding=0)
+        
+        # === NEW: Add marker visualization ===
+        self.update_marker_visualization()
+    
+    def update_marker_visualization(self):
+        """Add vertical lines and labels for markers on the plot"""
+        # Clear existing marker lines
+        for line in self.marker_lines:
+            try:
+                if self.display_mode == 'overlay':
+                    self.plot_widget.removeItem(line)
+                elif self.stacked_plot_item is not None:
+                    self.stacked_plot_item.removeItem(line)
+            except:
+                pass  # Item already removed
+        self.marker_lines.clear()
+        
+        # Get current visible time range
+        if self.display_mode == 'overlay':
+            if not hasattr(self, 'plot_widget') or self.plot_widget is None:
+                return
+            view_range = self.plot_widget.viewRange()[0]
+        else:
+            if self.stacked_plot_item is None:
+                return
+            view_range = self.stacked_plot_item.viewRange()[0]
+        
+        t_min, t_max = view_range
+        
+        # File mode: use file_markers
+        if self.mode == 'file' and self.file_markers:
+            for marker_time, marker_label in self.file_markers:
+                # Only show markers within visible range (with some padding)
+                if t_min - 1.0 <= marker_time <= t_max + 1.0:
+                    self._add_marker_line(marker_time, marker_label)
+        
+        # Streaming mode: use recorded markers from buffer
+        elif self.mode == 'stream' and self.recording_active:
+            if self.recording_buffer['markers'] and self.recording_start_time is not None:
+                for i, marker_label in enumerate(self.recording_buffer['markers']):
+                    marker_timestamp = self.recording_buffer['marker_timestamps'][i]
+                    # Convert absolute timestamp to relative time since recording start
+                    marker_time = marker_timestamp - self.recording_start_time
+                    
+                    # Only show markers within visible range
+                    if 0 <= marker_time <= self.window_size_sec:
+                        self._add_marker_line(marker_time, marker_label)
+
+    def _add_marker_line(self, time_pos, label):
+        """Add a single marker line to the plot"""
+        # Create vertical line at marker position
+        line = pg.InfiniteLine(
+            pos=time_pos,
+            angle=90,
+            pen=pg.mkPen(color=(255, 100, 100), width=2, style=Qt.DashLine),
+            label=label,
+            labelOpts={'position': 0.95, 'color': (255, 100, 100), 'fill': (50, 50, 50, 100)}
+        )
+        
+        # Add to appropriate plot
+        if self.display_mode == 'overlay':
+            self.plot_widget.addItem(line)
+        elif self.stacked_plot_item is not None:
+            self.stacked_plot_item.addItem(line)
+        
+        self.marker_lines.append(line)
     
     def on_stacked_range_changed(self):
         """Called when user pans in stacked mode - updates visible data"""
@@ -1691,6 +1806,9 @@ class SegmentViewer(QMainWindow):
             if ch_idx in self.stacked_plot_items:
                 offset_data = (all_data[k] - all_means[k]) * self.channel_amplitude_scale + offsets[k]
                 self.stacked_plot_items[ch_idx].setData(time_slice, offset_data)
+
+        # Update marker visualization when view changes
+        self.update_marker_visualization()
 
     def navigate_to_window(self, value):
         """Navigate to a specific window and update the view
@@ -2054,6 +2172,20 @@ class SegmentViewer(QMainWindow):
     def disconnect_headset(self):
         """Disconnect from headset"""
         try:
+            # === NEW: Check if recording is active ===
+            if self.recording_active:
+                response = QMessageBox.question(
+                    self,
+                    "Recording Active",
+                    "Recording is currently active. Stop recording and disconnect?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if response == QMessageBox.No:
+                    return
+                # Stop visualization (which stops recording)
+                if self.streaming_active:
+                    self.toggle_streaming_visualization()
+
             if self.streaming_active:
                 self.toggle_streaming_visualization()
 
@@ -2231,7 +2363,7 @@ class SegmentViewer(QMainWindow):
         self.start_marker_stream_btn.clicked.connect(self.start_marker_stream)
 
     def toggle_streaming_visualization(self):
-        """Start or stop real-time visualization"""
+        """Start or stop real-time visualization with automatic recording"""
         if not self.streaming_active:
             # Start streaming visualization
             self.streaming_active = True
@@ -2243,7 +2375,6 @@ class SegmentViewer(QMainWindow):
             self.play_pause_btn.setText("Stop Streaming")
 
             # Clear all plots and reset references BEFORE starting new visualization
-            # This ensures old data is cleared only when new data is about to replace it
             if hasattr(self, 'plot_widget') and self.plot_widget is not None:
                 self.plot_widget.clear()
             if hasattr(self, 'fft_plot_widget') and self.fft_plot_widget is not None:
@@ -2260,7 +2391,6 @@ class SegmentViewer(QMainWindow):
             self.bandpass_zi.clear()
             self.notch_zi.clear()
             # Fill buffer with NaN so unfilled regions aren't drawn
-            # (avoids zero-to-data boundary that causes filter transient spikes)
             if self.stream_buffer is not None:
                 self.stream_buffer[:] = np.nan
             # Drain any stale accumulated data from the board
@@ -2297,8 +2427,14 @@ class SegmentViewer(QMainWindow):
             self.file_mode_radio.setEnabled(False)
             self.stream_mode_radio.setEnabled(False)
 
+            # === NEW: Start Recording ===
+            self.start_recording()
+
         else:
             # Stop streaming visualization
+            # === NEW: Stop Recording First ===
+            self.stop_recording()
+            
             # Keep graphs visible - they will be cleared when new visualization starts
             self.streaming_active = False
             self.stream_timer.stop()
@@ -2310,6 +2446,313 @@ class SegmentViewer(QMainWindow):
             # Re-enable mode switching
             self.file_mode_radio.setEnabled(True)
             self.stream_mode_radio.setEnabled(True)
+
+    def start_recording(self):
+        """Start recording EEG and marker data to XDF file"""
+        if not XDF_AVAILABLE:
+            QMessageBox.warning(self, "Warning", "pyxdf is not installed.\nRecording disabled.\nInstall with: pip install pyxdf")
+            return
+
+        # Validate patient ID
+        self.patient_id = self.patient_id_input.text().strip()
+        if not self.patient_id:
+            QMessageBox.warning(self, "Warning", "Please enter a Patient ID before starting visualization/recording")
+            # Stop visualization since recording failed
+            self.toggle_streaming_visualization()
+            return
+
+        self.trial_number = self.trial_spinbox.value()
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"EEG_{self.patient_id}_Trial{self.trial_number:04d}_{timestamp}.xdf"
+        
+        # Create temp directory if it doesn't exist
+        temp_dir = os.path.join(os.path.expanduser("~"), ".eeg_viewer_recordings")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        self.recording_filepath = os.path.join(temp_dir, filename)
+        
+        # Clear recording buffer
+        self.recording_buffer = {
+            'eeg': [],
+            'markers': [],
+            'eeg_timestamps': [],
+            'marker_timestamps': []
+        }
+        
+        self.recording_active = True
+        self.recording_start_time = local_clock() if LSL_AVAILABLE else time.time()
+        self.recording_duration = 0.0
+        
+        # Start recording status timer (updates every second)
+        self.recording_timer.start(1000)
+        
+        # Update UI
+        self.recording_status.setText("🔴 Recording: 00:00")
+        self.recording_status.setStyleSheet("color: red; font-weight: bold;")
+        self.download_recording_btn.setEnabled(False)
+        
+        print(f"Recording started: {filename}")
+
+    def stop_recording(self):
+        """Stop recording and save to XDF file"""
+        if not self.recording_active:
+            return
+        
+        self.recording_active = False
+        self.recording_timer.stop()
+        
+        # Save to XDF file
+        try:
+            self.save_xdf_file()
+            
+            # Calculate file size
+            file_size_mb = os.path.getsize(self.recording_filepath) / (1024 * 1024)
+            
+            # Update UI
+            duration_str = self.format_duration(self.recording_duration)
+            self.recording_status.setText(f"✅ Recording saved: {os.path.basename(self.recording_filepath)} ({file_size_mb:.2f} MB, {duration_str})")
+            self.recording_status.setStyleSheet("color: green; font-weight: bold;")
+            self.download_recording_btn.setEnabled(True)
+            
+            print(f"Recording stopped and saved: {self.recording_filepath}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Recording Error", f"Failed to save recording:\n{str(e)}")
+            self.recording_status.setText("❌ Recording failed")
+            self.recording_status.setStyleSheet("color: red;")
+
+    def update_recording_status(self):
+        """Update recording duration display (called every second)"""
+        if self.recording_active and self.recording_start_time is not None:
+            current_time = local_clock() if LSL_AVAILABLE else time.time()
+            self.recording_duration = current_time - self.recording_start_time
+            
+            duration_str = self.format_duration(self.recording_duration)
+            self.recording_status.setText(f"🔴 Recording: {duration_str}")
+
+    def format_duration(self, seconds):
+        """Format duration in seconds to MM:SS or HH:MM:SS"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+        
+    def save_xdf_file(self):
+        """Save recording buffer to XDF file format"""
+        if not self.recording_buffer['eeg']:
+            raise ValueError("No EEG data recorded")
+        
+        # Prepare XDF structure
+        # XDF files store streams as a list of dictionaries
+        streams = []
+        
+        # === EEG Stream ===
+        eeg_data_list = self.recording_buffer['eeg']
+        eeg_timestamps = self.recording_buffer['eeg_timestamps']
+        
+        # Concatenate all EEG chunks
+        eeg_data_array = np.concatenate(eeg_data_list, axis=1)  # Shape: (channels, total_samples)
+        eeg_timestamps_array = np.array(eeg_timestamps)
+        
+        # Create EEG stream info (mimics LSL StreamInfo structure)
+        eeg_stream_name = f"EEG_{self.patient_id}_Trial{self.trial_number:04d}"
+        
+        eeg_stream = {
+            'time_series': eeg_data_array.T,  # XDF expects (samples, channels)
+            'time_stamps': eeg_timestamps_array,
+            'info': {
+                'name': [eeg_stream_name],
+                'type': ['EEG'],
+                'channel_count': [str(self.num_channels)],
+                'nominal_srate': [str(self.sampling_rate)],
+                'channel_format': ['float32'],
+                'source_id': [f'eeg_headset_{self.patient_id}'],
+                'desc': [{
+                    'channels': {
+                        'channel': [
+                            {'label': [self.get_channel_name(i)], 'unit': ['microvolts'], 'type': ['EEG']}
+                            for i in range(self.num_channels)
+                        ]
+                    }
+                }]
+            }
+        }
+        
+        streams.append(eeg_stream)
+        
+        # === Marker Stream (if markers were recorded) ===
+        if self.recording_buffer['markers']:
+            marker_data_list = self.recording_buffer['markers']
+            marker_timestamps = self.recording_buffer['marker_timestamps']
+            
+            # Convert markers to 2D array (samples, 1) for XDF format
+            marker_data_array = np.array(marker_data_list).reshape(-1, 1)
+            marker_timestamps_array = np.array(marker_timestamps)
+            
+            marker_stream_name = f"Markers_{self.patient_id}_Trial{self.trial_number:04d}"
+            
+            marker_stream = {
+                'time_series': marker_data_array,
+                'time_stamps': marker_timestamps_array,
+                'info': {
+                    'name': [marker_stream_name],
+                    'type': ['Markers'],
+                    'channel_count': ['1'],
+                    'nominal_srate': ['0'],  # Irregular rate
+                    'channel_format': ['string'],
+                    'source_id': [f'markers_{self.patient_id}']
+                }
+            }
+            
+            streams.append(marker_stream)
+        
+        # Write XDF file
+        # Note: pyxdf doesn't have a direct write function, so we'll use a workaround
+        # We'll create the file structure manually following XDF specification
+        self._write_xdf_file(self.recording_filepath, streams)
+        
+        print(f"XDF file saved: {self.recording_filepath}")
+        print(f"  - EEG samples: {eeg_data_array.shape[1]}")
+        print(f"  - Markers: {len(marker_data_list) if self.recording_buffer['markers'] else 0}")
+
+    def _write_xdf_file(self, filepath, streams):
+        """
+        Write XDF file manually since pyxdf is primarily for reading.
+        Uses a simplified XDF format compatible with pyxdf.load_xdf()
+        
+        For production use, consider using liblsl's built-in recording or
+        the LabRecorder application. This is a simplified implementation.
+        """
+        import struct
+        import xml.etree.ElementTree as ET
+        
+        with open(filepath, 'wb') as f:
+            # Write XDF magic code
+            f.write(b'XDF:')
+            
+            for stream in streams:
+                # Write stream header chunk (type 2)
+                self._write_chunk(f, 2, self._create_stream_header_xml(stream['info']))
+                
+                # Write samples chunk (type 3)
+                time_series = stream['time_series']
+                time_stamps = stream['time_stamps']
+                
+                for i in range(len(time_stamps)):
+                    sample_data = time_series[i]
+                    timestamp = time_stamps[i]
+                    self._write_sample_chunk(f, sample_data, timestamp, stream['info'])
+            
+            # Write footer chunk (type 6) - empty footer
+            self._write_chunk(f, 6, b'')
+
+    def _write_chunk(self, f, chunk_type, content):
+        """Write a chunk to XDF file"""
+        import struct
+        
+        # Convert content to bytes if it's a string
+        if isinstance(content, str):
+            content = content.encode('utf-8')
+        
+        # Chunk format: [Length:2][Tag:2][Content:Length-2]
+        length = len(content) + 2  # +2 for the tag
+        
+        f.write(struct.pack('<H', length))  # Length (2 bytes, little-endian)
+        f.write(struct.pack('<H', chunk_type))  # Tag (2 bytes)
+        f.write(content)
+
+    def _create_stream_header_xml(self, info):
+        """Create XML stream header for XDF file"""
+        import xml.etree.ElementTree as ET
+        
+        root = ET.Element('info')
+        
+        # Add basic info fields
+        for key in ['name', 'type', 'channel_count', 'nominal_srate', 'channel_format', 'source_id']:
+            if key in info:
+                elem = ET.SubElement(root, key)
+                elem.text = info[key][0] if isinstance(info[key], list) else str(info[key])
+        
+        # Add channel descriptions if present
+        if 'desc' in info and info['desc']:
+            desc = info['desc'][0]
+            if 'channels' in desc:
+                channels_elem = ET.SubElement(root, 'desc')
+                channels_container = ET.SubElement(channels_elem, 'channels')
+                
+                for ch_info in desc['channels']['channel']:
+                    ch_elem = ET.SubElement(channels_container, 'channel')
+                    for ch_key, ch_val in ch_info.items():
+                        ch_field = ET.SubElement(ch_elem, ch_key)
+                        ch_field.text = ch_val[0] if isinstance(ch_val, list) else str(ch_val)
+        
+        return ET.tostring(root, encoding='utf-8')
+
+    def _write_sample_chunk(self, f, sample_data, timestamp, stream_info):
+        """Write a sample chunk to XDF file"""
+        import struct
+        
+        # Sample chunk format: [timestamp:8][sample_data:varies]
+        content = struct.pack('<d', timestamp)  # 8-byte double for timestamp
+        
+        # Encode sample data based on channel format
+        channel_format = stream_info.get('channel_format', ['float32'])[0]
+        
+        if channel_format == 'float32':
+            for value in sample_data:
+                content += struct.pack('<f', float(value))
+        elif channel_format == 'string':
+            # For markers
+            marker_str = str(sample_data[0]) if len(sample_data) > 0 else ''
+            marker_bytes = marker_str.encode('utf-8')
+            content += struct.pack('<I', len(marker_bytes))  # String length
+            content += marker_bytes
+        
+        self._write_chunk(f, 3, content)  # Type 3 = samples
+
+    def download_recording(self):
+        """Allow user to download/save the recording to a custom location"""
+        if not self.recording_filepath or not os.path.exists(self.recording_filepath):
+            QMessageBox.warning(self, "No Recording", "No recording file available to download")
+            return
+        
+        # Suggest filename based on original
+        suggested_name = os.path.basename(self.recording_filepath)
+        
+        # Open save dialog
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Recording As",
+            suggested_name,
+            "XDF Files (*.xdf);;All Files (*)"
+        )
+        
+        if save_path:
+            try:
+                # Copy file to user-selected location
+                import shutil
+                shutil.copy2(self.recording_filepath, save_path)
+                
+                QMessageBox.information(
+                    self,
+                    "Download Successful",
+                    f"Recording saved to:\n{save_path}"
+                )
+                
+                print(f"Recording downloaded to: {save_path}")
+                
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "Download Failed",
+                    f"Failed to save recording:\n{str(e)}"
+                )
 
     def resize_stream_buffer(self, new_window_sec):
         """Resize the streaming buffer when the user changes window length"""
@@ -2358,6 +2801,23 @@ class SegmentViewer(QMainWindow):
 
             # Extract EEG channels
             eeg_data = data[self.eeg_channels, :]
+
+            # === NEW: Record RAW data before processing ===
+            if self.recording_active:
+                # Record raw EEG data with timestamps
+                current_time = local_clock() if LSL_AVAILABLE else time.time()
+                num_samples = eeg_data.shape[1]
+                
+                # Generate timestamps for each sample
+                sample_timestamps = np.linspace(
+                    current_time - (num_samples / self.sampling_rate),
+                    current_time,
+                    num_samples
+                )
+                
+                # Append to recording buffer
+                self.recording_buffer['eeg'].append(eeg_data.copy())
+                self.recording_buffer['eeg_timestamps'].extend(sample_timestamps.tolist())
 
             # Send to LSL if outlet is active - use push_chunk for efficiency
             if self.eeg_outlet is not None and LSL_AVAILABLE:
@@ -2572,6 +3032,9 @@ class SegmentViewer(QMainWindow):
                 self.stream_first_update = False
                 self.plot_widget.enableAutoRange()
 
+        # Update marker visualization when view changes
+        self.update_marker_visualization()
+
     def update_fft(self):
         """Calculate and display FFT for active channels with smoothing - reuses plot items"""
         if not self.active_channels or self.stream_buffer is None:
@@ -2732,8 +3195,39 @@ class SegmentViewer(QMainWindow):
 
         # Send a marker if marker stream is active
         if self.marker_outlet is not None and LSL_AVAILABLE:
-            self.marker_outlet.push_sample(['MOTOR_IMAGERY_START'])
-            print("Marker sent: MOTOR_IMAGERY_START")
+            marker_label = 'MOTOR_IMAGERY_START'
+            current_time = local_clock()
+            
+            self.marker_outlet.push_sample([marker_label])
+            
+            # === NEW: Record marker ===
+            if self.recording_active:
+                self.recording_buffer['markers'].append(marker_label)
+                self.recording_buffer['marker_timestamps'].append(current_time)
+            
+            print(f"Marker sent: {marker_label}")
+
+    def send_marker(self, marker_label):
+        """
+        Utility method to send markers (use this in your motor imagery tasks)
+        
+        Args:
+            marker_label: String label for the marker (e.g., 'LEFT_HAND_CUE')
+        """
+        if self.marker_outlet is not None and LSL_AVAILABLE:
+            current_time = local_clock()
+            self.marker_outlet.push_sample([marker_label])
+            
+            # Record marker if recording is active
+            if self.recording_active:
+                self.recording_buffer['markers'].append(marker_label)
+                self.recording_buffer['marker_timestamps'].append(current_time)
+            
+            print(f"Marker sent: {marker_label} at {current_time:.3f}s")
+            return current_time
+        else:
+            print("Warning: Marker stream not active")
+            return None
 
     def on_magnitude_changed(self, text):
         """Handle magnitude scale change"""
