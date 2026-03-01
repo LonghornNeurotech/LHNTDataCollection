@@ -393,13 +393,16 @@ class SegmentViewer(QMainWindow):
         stream_layout.addWidget(QLabel("Recording:"))
         self.recording_status = QLabel("Recording: Inactive")
         self.recording_status.setStyleSheet("color: gray;")
+        self.recording_status.setWordWrap(True)  # NEW: Allow text wrapping
         stream_layout.addWidget(self.recording_status)
 
         # === NEW: Download Recording Button ===
-        self.download_recording_btn = QPushButton("💾 Download Recording")
+        self.download_recording_btn = QPushButton("💾 Download")  # SHORTENED TEXT
         self.download_recording_btn.clicked.connect(self.download_recording)
         self.download_recording_btn.setEnabled(False)
-        self.download_recording_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        self.download_recording_btn.setMinimumHeight(35)  # NEW: Consistent height
+        self.download_recording_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; font-size: 11pt;")  # NEW: Smaller font
+        self.download_recording_btn.setToolTip("Download recorded EEG data to your computer")  # NEW: Tooltip for clarity
         stream_layout.addWidget(self.download_recording_btn)
 
         # Motor imagery task button (placeholder)
@@ -2621,100 +2624,248 @@ class SegmentViewer(QMainWindow):
         print(f"  - EEG samples: {eeg_data_array.shape[1]}")
         print(f"  - Markers: {len(marker_data_list) if self.recording_buffer['markers'] else 0}")
 
-    def _write_xdf_file(self, filepath, streams):
-        """
-        Write XDF file manually since pyxdf is primarily for reading.
-        Uses a simplified XDF format compatible with pyxdf.load_xdf()
+    def save_xdf_file(self):
+        """Save recording buffer to XDF file format with correct variable-length encoding"""
+        if not self.recording_buffer['eeg']:
+            raise ValueError("No EEG data recorded")
         
-        For production use, consider using liblsl's built-in recording or
-        the LabRecorder application. This is a simplified implementation.
-        """
         import struct
-        import xml.etree.ElementTree as ET
         
-        with open(filepath, 'wb') as f:
-            # Write XDF magic code
+        eeg_data_list = self.recording_buffer['eeg']
+        eeg_timestamps = self.recording_buffer['eeg_timestamps']
+        
+        # Concatenate all EEG chunks
+        eeg_data_array = np.concatenate(eeg_data_list, axis=1)  # Shape: (channels, total_samples)
+        eeg_timestamps_array = np.array(eeg_timestamps)
+        
+        eeg_stream_name = f"EEG_{self.patient_id}_Trial{self.trial_number:04d}"
+        
+        with open(self.recording_filepath, 'wb') as f:
+            # Write XDF magic bytes
             f.write(b'XDF:')
             
-            for stream in streams:
-                # Write stream header chunk (type 2)
-                self._write_chunk(f, 2, self._create_stream_header_xml(stream['info']))
-                
-                # Write samples chunk (type 3)
-                time_series = stream['time_series']
-                time_stamps = stream['time_stamps']
-                
-                for i in range(len(time_stamps)):
-                    sample_data = time_series[i]
-                    timestamp = time_stamps[i]
-                    self._write_sample_chunk(f, sample_data, timestamp, stream['info'])
+            # === Stream 1: EEG Header ===
+            header_xml = self._create_stream_header_xml_correct(
+                name=eeg_stream_name,
+                type='EEG',
+                channel_count=self.num_channels,
+                nominal_srate=self.sampling_rate,
+                channel_format='float32',
+                source_id=f'eeg_headset_{self.patient_id}',
+                channels=[self.get_channel_name(i) for i in range(self.num_channels)]
+            )
+            self._write_chunk_correct(f, 2, header_xml.encode('utf-8'))
             
-            # Write footer chunk (type 6) - empty footer
-            self._write_chunk(f, 6, b'')
+            # === Stream 1: EEG Samples ===
+            stream_id = 1
+            for i in range(eeg_data_array.shape[1]):
+                sample = eeg_data_array[:, i]
+                timestamp = eeg_timestamps_array[i]
+                sample_bytes = self._encode_sample(timestamp, sample, 'float32')
+                self._write_sample_chunk_correct(f, stream_id, sample_bytes)
+            
+            # === Stream 2: Markers (if present) ===
+            if self.recording_buffer['markers']:
+                marker_stream_name = f"Markers_{self.patient_id}_Trial{self.trial_number:04d}"
+                
+                marker_header_xml = self._create_stream_header_xml_correct(
+                    name=marker_stream_name,
+                    type='Markers',
+                    channel_count=1,
+                    nominal_srate=0,
+                    channel_format='string',
+                    source_id=f'markers_{self.patient_id}',
+                    channels=['Marker']
+                )
+                self._write_chunk_correct(f, 2, marker_header_xml.encode('utf-8'))
+                
+                marker_stream_id = 2
+                for i, marker_label in enumerate(self.recording_buffer['markers']):
+                    marker_timestamp = self.recording_buffer['marker_timestamps'][i]
+                    marker_bytes = self._encode_sample(marker_timestamp, [marker_label], 'string')
+                    self._write_sample_chunk_correct(f, marker_stream_id, marker_bytes)
+            
+            # === Footer (empty chunk type 6) ===
+            self._write_chunk_correct(f, 6, b'')
+        
+        print(f"XDF file saved: {self.recording_filepath}")
+        print(f"  - EEG samples: {eeg_data_array.shape[1]}")
+        print(f"  - Markers: {len(self.recording_buffer['markers'])}")
 
-    def _write_chunk(self, f, chunk_type, content):
-        """Write a chunk to XDF file"""
+    def _write_varlen_int_correct(self, value):
+        """Encode a variable-length integer according to XDF spec
+        
+        Returns bytes object with encoded integer.
+        
+        XDF variable-length encoding:
+        - 0-253: single byte with the value
+        - 254: followed by 4-byte uint32 (little-endian)
+        - 255: followed by 8-byte uint64 (little-endian)
+        """
         import struct
         
-        # Convert content to bytes if it's a string
-        if isinstance(content, str):
-            content = content.encode('utf-8')
-        
-        # Chunk format: [Length:2][Tag:2][Content:Length-2]
-        length = len(content) + 2  # +2 for the tag
-        
-        f.write(struct.pack('<H', length))  # Length (2 bytes, little-endian)
-        f.write(struct.pack('<H', chunk_type))  # Tag (2 bytes)
-        f.write(content)
+        if value < 254:
+            return struct.pack('B', value)
+        elif value <= 0xFFFFFFFF:  # Fits in uint32
+            return struct.pack('B', 254) + struct.pack('<I', value)
+        else:  # Needs uint64
+            return struct.pack('B', 255) + struct.pack('<Q', value)
 
-    def _create_stream_header_xml(self, info):
-        """Create XML stream header for XDF file"""
+    def _write_chunk_correct(self, f, chunk_tag, content_bytes):
+        """Write a chunk with correct XDF format
+        
+        Chunk structure:
+        [NumLengthBytes:1][Length:variable][Tag:2][Content:Length-2]
+        
+        Note: Length includes the 2-byte tag
+        """
+        import struct
+        
+        if isinstance(content_bytes, str):
+            content_bytes = content_bytes.encode('utf-8')
+        
+        # Total chunk content = tag (2 bytes) + actual content
+        chunk_content = struct.pack('<H', chunk_tag) + content_bytes
+        chunk_length = len(chunk_content)
+        
+        # Encode length as variable-length integer
+        length_bytes = self._write_varlen_int_correct(chunk_length)
+        
+        # NumLengthBytes = how many bytes were used to encode the length
+        num_length_bytes = len(length_bytes)
+        
+        # Write: [NumLengthBytes][Length][Content]
+        f.write(struct.pack('B', num_length_bytes))
+        f.write(length_bytes)
+        f.write(chunk_content)
+
+    def _write_sample_chunk_correct(self, f, stream_id, sample_bytes):
+        """Write a sample chunk (type 3) with stream ID
+        
+        Sample chunk structure:
+        [NumLengthBytes:1][Length:variable][Tag:2][StreamID:variable][SampleData]
+        """
+        import struct
+        
+        # Encode stream ID as variable-length integer
+        stream_id_bytes = self._write_varlen_int_correct(stream_id)
+        
+        # Chunk content = tag (2 bytes) + stream_id (variable) + sample data
+        chunk_content = struct.pack('<H', 3) + stream_id_bytes + sample_bytes
+        chunk_length = len(chunk_content)
+        
+        # Encode length as variable-length integer
+        length_bytes = self._write_varlen_int_correct(chunk_length)
+        num_length_bytes = len(length_bytes)
+        
+        # Write chunk
+        f.write(struct.pack('B', num_length_bytes))
+        f.write(length_bytes)
+        f.write(chunk_content)
+
+    def _encode_sample(self, timestamp, sample_data, channel_format):
+        """Encode a single sample's data
+        
+        Returns bytes object with: [timestamp:8][channel_data:variable]
+        """
+        import struct
+        import io
+        
+        buffer = io.BytesIO()
+        
+        # Write timestamp (8-byte double, little-endian)
+        buffer.write(struct.pack('<d', timestamp))
+        
+        # Write channel data based on format
+        if channel_format == 'float32':
+            for value in sample_data:
+                buffer.write(struct.pack('<f', float(value)))
+        
+        elif channel_format == 'string':
+            # String format: [length:varint][utf8_bytes]
+            marker_str = str(sample_data[0]) if len(sample_data) > 0 else ''
+            marker_bytes = marker_str.encode('utf-8')
+            
+            # Write string length and content
+            buffer.write(self._write_varlen_int_correct(len(marker_bytes)))
+            buffer.write(marker_bytes)
+        
+        return buffer.getvalue()
+
+    def _create_stream_header_xml_correct(self, name, type, channel_count, 
+                                        nominal_srate, channel_format, source_id, channels):
+        """Create XML stream header (correct format for XDF)"""
         import xml.etree.ElementTree as ET
         
         root = ET.Element('info')
         
-        # Add basic info fields
-        for key in ['name', 'type', 'channel_count', 'nominal_srate', 'channel_format', 'source_id']:
-            if key in info:
-                elem = ET.SubElement(root, key)
-                elem.text = info[key][0] if isinstance(info[key], list) else str(info[key])
+        # Basic stream info
+        ET.SubElement(root, 'name').text = name
+        ET.SubElement(root, 'type').text = type
+        ET.SubElement(root, 'channel_count').text = str(channel_count)
+        ET.SubElement(root, 'nominal_srate').text = str(nominal_srate)
+        ET.SubElement(root, 'channel_format').text = channel_format
+        ET.SubElement(root, 'source_id').text = source_id
         
-        # Add channel descriptions if present
-        if 'desc' in info and info['desc']:
-            desc = info['desc'][0]
-            if 'channels' in desc:
-                channels_elem = ET.SubElement(root, 'desc')
-                channels_container = ET.SubElement(channels_elem, 'channels')
-                
-                for ch_info in desc['channels']['channel']:
-                    ch_elem = ET.SubElement(channels_container, 'channel')
-                    for ch_key, ch_val in ch_info.items():
-                        ch_field = ET.SubElement(ch_elem, ch_key)
-                        ch_field.text = ch_val[0] if isinstance(ch_val, list) else str(ch_val)
+        # Version info (required by some readers)
+        ET.SubElement(root, 'version').text = '1.0'
         
-        return ET.tostring(root, encoding='utf-8')
+        # Created timestamp
+        ET.SubElement(root, 'created_at').text = str(time.time())
+        
+        # Channel descriptions
+        if channels:
+            desc = ET.SubElement(root, 'desc')
+            channels_elem = ET.SubElement(desc, 'channels')
+            
+            for ch_name in channels:
+                ch = ET.SubElement(channels_elem, 'channel')
+                ET.SubElement(ch, 'label').text = ch_name
+                if type == 'EEG':
+                    ET.SubElement(ch, 'unit').text = 'microvolts'
+                    ET.SubElement(ch, 'type').text = 'EEG'
+        
+        # Convert to string with XML declaration
+        xml_str = ET.tostring(root, encoding='unicode', method='xml')
+        return '<?xml version="1.0"?>' + xml_str
 
-    def _write_sample_chunk(self, f, sample_data, timestamp, stream_info):
-        """Write a sample chunk to XDF file"""
-        import struct
+    def download_recording(self):
+        """Allow user to download/save the recording to a custom location"""
+        if not self.recording_filepath or not os.path.exists(self.recording_filepath):
+            QMessageBox.warning(self, "No Recording", "No recording file available to download")
+            return
         
-        # Sample chunk format: [timestamp:8][sample_data:varies]
-        content = struct.pack('<d', timestamp)  # 8-byte double for timestamp
+        # Suggest filename based on original
+        suggested_name = os.path.basename(self.recording_filepath)
         
-        # Encode sample data based on channel format
-        channel_format = stream_info.get('channel_format', ['float32'])[0]
+        # Open save dialog
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Recording As",
+            suggested_name,
+            "XDF Files (*.xdf);;All Files (*)"
+        )
         
-        if channel_format == 'float32':
-            for value in sample_data:
-                content += struct.pack('<f', float(value))
-        elif channel_format == 'string':
-            # For markers
-            marker_str = str(sample_data[0]) if len(sample_data) > 0 else ''
-            marker_bytes = marker_str.encode('utf-8')
-            content += struct.pack('<I', len(marker_bytes))  # String length
-            content += marker_bytes
-        
-        self._write_chunk(f, 3, content)  # Type 3 = samples
+        if save_path:
+            try:
+                # Copy file to user-selected location
+                import shutil
+                shutil.copy2(self.recording_filepath, save_path)
+                
+                QMessageBox.information(
+                    self,
+                    "Download Successful",
+                    f"Recording saved to:\n{save_path}"
+                )
+                
+                print(f"Recording downloaded to: {save_path}")
+                
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "Download Failed",
+                    f"Failed to save recording:\n{str(e)}"
+                    )
 
     def download_recording(self):
         """Allow user to download/save the recording to a custom location"""
@@ -3285,6 +3436,18 @@ class SegmentViewer(QMainWindow):
 
     def apply_theme(self):
         """Apply the selected theme to the application"""
+        # === NEW: Warn if streaming is active ===
+        if self.streaming_active:
+            response = QMessageBox.warning(
+                self,
+                "Streaming Active",
+                "Changing theme during active streaming may cause brief visualization interruption.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if response == QMessageBox.No:
+                # Revert theme selection in settings dialog
+                return
+        
         app = QApplication.instance()
 
         if self.theme == 'dark':
@@ -3358,6 +3521,12 @@ class SegmentViewer(QMainWindow):
         # Update backgrounds and foregrounds on existing plot widgets
         bg = (20, 20, 20) if self.theme == 'dark' else 'w'
         fg = (230, 230, 230) if self.theme == 'dark' else 'k'
+        
+        # === NEW: Temporarily pause streaming updates during theme change ===
+        streaming_was_active = self.streaming_active
+        if streaming_was_active:
+            self.stream_timer.stop()
+        
         if hasattr(self, 'plot_widget') and self.plot_widget is not None:
             self.plot_widget.setBackground(bg)
         for pw in [getattr(self, 'fft_plot_widget', None),
@@ -3381,12 +3550,19 @@ class SegmentViewer(QMainWindow):
             self.fft_plot_widget.clear()
 
         # Rebuild plots so new colors and background take effect
-        if self.file_loaded or self.streaming_active:
+        if self.file_loaded or streaming_was_active:
             if self.display_mode == 'stacked':
                 self.setup_stacked_mode()
             else:
                 self.setup_overlay_mode()
-            self.update_plot()
+            
+            # === NEW: Only update plot if not streaming (streaming will resume automatically) ===
+            if not streaming_was_active:
+                self.update_plot()
+        
+        # === NEW: Resume streaming if it was active ===
+        if streaming_was_active:
+            self.stream_timer.start(16)
 
     def calculate_fft_for_file(self):
         """Calculate and display FFT for file mode with smoothing - reuses plot items"""
